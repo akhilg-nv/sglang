@@ -183,10 +183,9 @@ class TestDSV4TrtllmCounterBuffer(CustomTestCase):
             pack_sparse_tail,
         )
 
-        # Dense decode: one query row per FlashInfer request.
-        seq_lens = torch.randint(
-            SWA + 1, 1 << 16, (ROWS,), dtype=torch.int32, device="cuda"
-        )
+        # Dense decode: one query row per FlashInfer request. seq_lens bound only
+        # the SWA window, so about half the rows are shorter than it.
+        seq_lens = torch.randint(1, 2 * SWA, (ROWS,), dtype=torch.int32, device="cuda")
         table, lens = _tile(SWA + TAIL, fill=-1), _tile(fill=SWA)
         table[:ROWS, :SWA] = _idx(ROWS, SWA)
         tail_lens = torch.randint(
@@ -229,9 +228,10 @@ class TestDSV4TrtllmCounterBuffer(CustomTestCase):
         self.assertEqual(_pdl_into_attention(pack_then_run), [True])
 
     def test_prefill(self):
-        # Requests of 3 and 9 tokens, one dense row per token; q is padded to 16 rows.
+        # A new 3-token request (inside the SWA window) and 9 tokens after an 8K
+        # prefix, one dense row per token; q is padded to 16 rows.
         sum_q, pad = 12, 16
-        seq_lens = torch.cat([torch.arange(4097, 4100), torch.arange(8193, 8202)])
+        seq_lens = torch.cat([torch.arange(1, 4), torch.arange(8193, 8202)])
         seq_lens = seq_lens.to(torch.int32).cuda()
         table, lens = _tile(SWA + TAIL, fill=-1), _tile(fill=SWA)
         tail_lens = torch.empty(sum_q, dtype=torch.int32, device="cuda")
