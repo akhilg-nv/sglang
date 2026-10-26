@@ -34,6 +34,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_spec,
     max_prefill_buffer_tokens,
+    max_speculative_num_draft_tokens,
 )
 from sglang.srt.utils import ceil_align, ceil_div
 
@@ -78,10 +79,10 @@ def _trtllm_query_row_capacity(model_runner: ModelRunner) -> int:
         schedule.max_prefill_tokens or 0,
         max_prefill_buffer_tokens(),
     )
-    spec = get_spec()
+    # Adaptive spec may widen the draft up to its launch-time max.
     rows_per_req = (
-        (spec.speculative_num_draft_tokens or 1)
-        if spec.speculative_algorithm is not None
+        (max_speculative_num_draft_tokens() or 1)
+        if get_spec().speculative_algorithm is not None
         else 1
     )
     rows = max(rows, (schedule.max_running_requests or 0) * rows_per_req)
