@@ -109,7 +109,11 @@ def _get_trtllm_counter_buffer(
         lambda: make_persistent_multi_ctas_kv_counter_buffer(
             device,
             max(64, model_runner.model_config.num_attention_heads),
-            _trtllm_query_row_capacity(model_runner),
+            max(
+                _trtllm_query_row_capacity(model_runner),
+                model_runner.req_to_token_pool.req_to_token.shape[0]
+                * (max_speculative_num_draft_tokens() or 1),
+            ),
         ),
     )
 
