@@ -707,7 +707,7 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             )
         )
 
-    def test_trtllm_semaphore_capacity_covers_configured_query_rows(self):
+    def test_trtllm_counter_capacity_covers_configured_query_rows(self):
         from sglang.srt.layers.attention import deepseek_v4_trtllm_backend as trtllm
 
         schedule = SimpleNamespace(max_prefill_tokens=16384, max_running_requests=256)
@@ -725,11 +725,6 @@ class TestDSV4BreakableCudaGraphMetadataContract(CustomTestCase):
             # Decode rows = requests x draft tokens dominate.
             schedule.max_running_requests = 8192
             self.assertEqual(trtllm._trtllm_query_row_capacity(model_runner), 32768)
-
-        with mock.patch.object(trtllm, "_trtllm_semaphore_rows", 64):
-            trtllm._check_trtllm_query_rows(64)
-            with self.assertRaisesRegex(RuntimeError, "exceeds the persistent"):
-                trtllm._check_trtllm_query_rows(65)
 
     def test_sparse_prefill_kv_buffer_reuses_and_grows(self):
         from sglang.srt.layers.attention.dsv4.sparse_prefill_utils import (
