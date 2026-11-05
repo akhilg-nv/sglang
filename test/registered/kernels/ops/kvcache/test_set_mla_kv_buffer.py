@@ -251,6 +251,29 @@ def test_set_mla_kv_buffer_triton_zero_index_can_be_written_when_skip_disabled()
     )
 
 
+@pytest.mark.parametrize("shape", [(512, 64), (TRITON_NOPE_DIM, 0)])
+def test_set_mla_kv_buffer_triton_strided_loc(shape):
+    """Rows land at their own locs when `loc` is a strided view, such as one
+    EAGLE draft step's column of the request-major draft slots."""
+    nope_dim, rope_dim = shape
+    dtype = torch.bfloat16
+    bs, num_steps = 4, 3
+    draft_locs = torch.randperm(CACHE_SIZE - 1, device=DEVICE)[: bs * num_steps] + 1
+    loc = draft_locs.view(bs, num_steps)[:, 1]
+    assert not loc.is_contiguous()
+    cache_k_nope = torch.randn((bs, 1, nope_dim), dtype=dtype, device=DEVICE)
+    cache_k_rope = torch.randn((bs, 1, rope_dim), dtype=dtype, device=DEVICE)
+    kv_buffer = torch.randn(
+        (CACHE_SIZE, 1, nope_dim + rope_dim), dtype=dtype, device=DEVICE
+    )
+    kv_ref = kv_buffer.clone()
+
+    set_mla_kv_buffer_triton(kv_buffer, loc, cache_k_nope, cache_k_rope)
+    _ref(kv_ref, loc, cache_k_nope, cache_k_rope)
+
+    torch.testing.assert_close(kv_buffer, kv_ref, rtol=0.0, atol=0.0)
+
+
 def test_set_mla_kv_buffer_triton_fp8_quant_reserved_skip_index():
     fp8_dtype = torch.float8_e4m3fnuz if torch.version.hip else torch.float8_e4m3fn
     cache_k_nope = torch.randn(

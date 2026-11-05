@@ -214,6 +214,9 @@ def _set_mla_kv_buffer_impl(
         )
         return
 
+    # The kernels below read `loc` densely; a strided view (an EAGLE draft
+    # step's out_cache_loc) would scatter rows into its neighbors' slots.
+    loc = loc.contiguous()
     has_rope = cache_k_rope is not None and cache_k_rope.numel() > 0
     n_loc = loc.numel()
     nope_dim = cache_k_nope.shape[-1]
