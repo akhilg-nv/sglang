@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import bisect
+import json
 import logging
 from enum import Enum
 from typing import TYPE_CHECKING, Callable, List, Optional
@@ -211,6 +213,79 @@ _BF16_SPLITK_TUNED_TACTICS = {
 }
 
 
+# (n, k) -> (m_max per row, kernel per row) from SGLANG_BF16_GEMM_SHAPE_TABLE.
+_BF16_SHAPE_TABLE: dict = {}
+_BF16_SHAPES_SEEN: Optional[set] = None
+
+
+def _log_bf16_shape(m: int, n: int, k: int) -> None:
+    global _BF16_SHAPES_SEEN
+    path = envs.SGLANG_BF16_GEMM_SHAPE_LOG.get()
+    if not path:
+        return
+    if _BF16_SHAPES_SEEN is None:
+        _BF16_SHAPES_SEEN = set()
+    if (m, n, k) not in _BF16_SHAPES_SEEN:
+        _BF16_SHAPES_SEEN.add((m, n, k))
+        with open(path, "a") as f:
+            f.write(f"{m} {n} {k}\n")
+
+
+def _load_bf16_shape_table() -> None:
+    global _BF16_SHAPE_TABLE
+    path = envs.SGLANG_BF16_GEMM_SHAPE_TABLE.get()
+    if not path:
+        return
+    with open(path) as f:
+        shapes = json.load(f)["shapes"]
+    _BF16_SHAPE_TABLE = {
+        tuple(int(d) for d in nk.split(",")): (
+            [m for m, _ in rows],
+            [kernel for _, kernel in rows],
+        )
+        for nk, rows in shapes.items()
+    }
+    logger.info(
+        f"BF16 GEMM shape table: {len(_BF16_SHAPE_TABLE)} (N, K) shapes from {path}"
+    )
+
+
+def _bf16_table_kernel(m: int, n: int, k: int) -> Optional[str]:
+    """Kernel the shape table picks for M in (previous m_max, m_max]; None keeps the default dispatch."""
+    entry = _BF16_SHAPE_TABLE.get((n, k))
+    if entry is None or m <= 0:
+        return None
+    m_max, kernels = entry
+    i = bisect.bisect_left(m_max, m)
+    if i == len(m_max) or kernels[i] == "default":
+        return None
+    return kernels[i]
+
+
+def _bf16_table_gemm(
+    kernel: str, x: torch.Tensor, weight: torch.Tensor
+) -> torch.Tensor:
+    x_2d = x.reshape(-1, x.shape[-1])
+    if kernel == "fi_cute_dsl":
+        from flashinfer import mm_bf16
+
+        out = torch.empty(
+            (x_2d.shape[0], weight.shape[0]), dtype=x.dtype, device=x.device
+        )
+        mm_bf16(x_2d, weight.t(), out=out, backend="cute-dsl")
+    elif kernel == "tgv":
+        from sglang.kernels.ops.gemm.cutedsl_bf16_gemm import cutedsl_bf16_gemm
+
+        out = cutedsl_bf16_gemm(x_2d, weight, None)
+    elif kernel == "tiny":
+        from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+
+        out = tiny_gemm_bf16(x_2d, weight, max_m=16)
+    else:
+        out = F.linear(x_2d, weight)
+    return out.view(*x.shape[:-1], weight.shape[0])
+
+
 def use_bf16_splitk_gemm(m: int, n: int, k: int) -> bool:
     return (m, n, k) in _BF16_SPLITK_TUNED_TACTICS
 
@@ -305,6 +380,7 @@ def initialize_bf16_gemm_config() -> None:
         _run_direct_dense = run_direct_dense
         _enable_bf16_splitk_gemm = True
 
+    _load_bf16_shape_table()
     _BF16_GEMM_BACKEND = backend
 
 
@@ -353,7 +429,15 @@ def _bf16_gemm_dispatch_impl(
     addend: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     m = x.numel() // x.shape[-1]
-    if _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
+    _log_bf16_shape(m, weight.shape[0], weight.shape[1])
+    table_kernel = (
+        _bf16_table_kernel(m, weight.shape[0], weight.shape[1])
+        if _BF16_SHAPE_TABLE and bias is None
+        else None
+    )
+    if table_kernel is not None:
+        output = _bf16_table_gemm(table_kernel, x, weight)
+    elif _enable_bf16_splitk_gemm and use_bf16_splitk_gemm(
         m, weight.shape[0], weight.shape[1]
     ):
         output = _bf16_splitk_gemm(x, weight, bias)

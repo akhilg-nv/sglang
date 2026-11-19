@@ -129,6 +129,12 @@ class HcRead:
     def bind(self, batch, call):
         return HcReadCall(self, batch, call)
 
+    def _accepts_mxfp8(self):
+        """Whether this sublayer's first projection takes a 128x4 MXFP8 tuple."""
+        if self.attention:
+            return self.layer.self_attn.accepts_mxfp8_swizzled_input()
+        return self.layer.ffn_accepts_mxfp8_swizzled_input()
+
     @staticmethod
     def init_residual(hidden_states):
         return hidden_states
@@ -183,8 +189,7 @@ class HcReadCall(HcRead):
             self.layer.input_layernorm
             if self.attention
             else self.layer.post_attention_layernorm,
-            accepts_mxfp8=self.attention
-            and self.layer.self_attn.accepts_mxfp8_swizzled_input(),
+            accepts_mxfp8=self._accepts_mxfp8(),
             hc=hc,
         )
 
@@ -211,11 +216,7 @@ class HcReadCall(HcRead):
                 else None
             )
             mhc.fork_stats_stream(stream)
-            quantized = (
-                []
-                if self.attention and layer.self_attn.accepts_mxfp8_swizzled_input()
-                else None
-            )
+            quantized = [] if self._accepts_mxfp8() else None
             hc = layer.attn_hc if self.attention else layer.ffn_hc
             x = mhc.combine(hc, residual, quantized)
             stats = residual.stats

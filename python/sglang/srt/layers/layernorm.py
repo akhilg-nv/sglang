@@ -397,6 +397,44 @@ def _forward_with_allreduce_fusion_quant_per_group(
     return (bf16_out, fp8_out, scale_out), residual_out
 
 
+def _forward_with_allreduce_fusion_static_fp8(
+    norm_module,
+    x: torch.Tensor,
+    residual: Optional[torch.Tensor],
+    post_residual_addition: Optional[torch.Tensor],
+    weight: torch.Tensor,
+    input_scale: torch.Tensor,
+    keep_bf16: bool,
+    use_attn_tp_group: bool = True,
+):
+    """The flashinfer all-reduce + residual add + RMSNorm over the attention TP
+    group (or the MoE output's group), with the norm quantized to FP8 by the
+    static ``input_scale``: ``((fp8, input_scale), residual)``, or ``((bf16,
+    fp8, input_scale), residual)`` with ``keep_bf16``. None when the kernel
+    does not take it."""
+    if residual is None or post_residual_addition is not None:
+        return None
+    from sglang.srt.layers.flashinfer_comm_fusion import (
+        flashinfer_allreduce_residual_rmsnorm_static_fp8,
+    )
+
+    fp8_out, bf16_out, residual_out = flashinfer_allreduce_residual_rmsnorm_static_fp8(
+        input_tensor=x,
+        residual=residual,
+        weight=weight,
+        scale=input_scale,
+        eps=norm_module.variance_epsilon,
+        max_token_num=max(x.shape[0], 2048),
+        keep_bf16=keep_bf16,
+        use_attn_tp_group=use_attn_tp_group,
+    )
+    if fp8_out is None:
+        return None
+    if keep_bf16:
+        return (bf16_out, fp8_out, input_scale), residual_out
+    return (fp8_out, input_scale), residual_out
+
+
 def _fp8_static_input_scale(linear) -> Optional[torch.Tensor]:
     """Return the per-tensor static FP8 activation scale of ``linear`` if it is
     an FP8 linear using static per-tensor activation scaling that can consume a
@@ -451,6 +489,10 @@ def _is_static_per_tensor_fp8_linear(quant_method, linear) -> bool:
 class RMSNorm(BaseFusedOp):
     # The projection that consumes this norm's output; see fuse_input_quant().
     _quant_linear: Optional[nn.Module] = None
+    # The static per-tensor FP8 projection whose input quant
+    # forward_with_allreduce_fusion also applies; see fuse_allreduce_input_quant().
+    _ar_quant_linear: Optional[nn.Module] = None
+    _ar_quant_keeps_bf16: bool = False
 
     def __init__(
         self,
@@ -507,6 +549,15 @@ class RMSNorm(BaseFusedOp):
         projection that consumes this norm's output, whenever forward_cuda can.
         The projection stays out of this module's children."""
         self.__dict__["_quant_linear"] = linear
+
+    def fuse_allreduce_input_quant(self, linear: nn.Module, keep_bf16: bool) -> None:
+        """Quantize the norm from forward_with_allreduce_fusion to FP8 with the
+        static per-tensor input_scale of ``linear`` (a ModelOptFp8LinearMethod
+        projection, see accepts_static_fp8_input), handing on (fp8, scale), or
+        (bf16, fp8, scale) with ``keep_bf16`` for the norm's BF16 consumers.
+        Unlike fuse_input_quant, forward_cuda stays BF16."""
+        self.__dict__["_ar_quant_linear"] = linear
+        self._ar_quant_keeps_bf16 = keep_bf16
 
     def forward_cuda(
         self,
@@ -926,6 +977,19 @@ class RMSNorm(BaseFusedOp):
         use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion, prioritizing flashinfer fused operations."""
+        if self._ar_quant_linear is not None:
+            fused = _forward_with_allreduce_fusion_static_fp8(
+                self,
+                x,
+                residual,
+                post_residual_addition,
+                self.weight,
+                self._ar_quant_linear.input_scale,
+                keep_bf16=self._ar_quant_keeps_bf16,
+                use_attn_tp_group=use_attn_tp_group,
+            )
+            if fused is not None:
+                return fused
         return _forward_with_allreduce_fusion(
             self, x, residual, post_residual_addition, self.weight, use_attn_tp_group
         )
@@ -1094,6 +1158,11 @@ class LayerNorm(BaseFusedOp):
 
 
 class GemmaRMSNorm(BaseFusedOp):
+    # The FP8 projection whose static input quant forward_with_allreduce_fusion
+    # also applies; see fuse_input_quant().
+    _quant_linear: Optional[nn.Module] = None
+    _quant_keeps_bf16: bool = False
+
     def __init__(
         self,
         hidden_size: int,
@@ -1277,6 +1346,18 @@ class GemmaRMSNorm(BaseFusedOp):
         use_attn_tp_group: bool = True,
     ) -> Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]:
         """Forward with allreduce fusion; uses 1 + weight for fused kernels."""
+        if self._quant_linear is not None:
+            fused = _forward_with_allreduce_fusion_static_fp8(
+                self,
+                x,
+                residual,
+                post_residual_addition,
+                self.gemma_weight,
+                self._quant_linear.input_scale,
+                keep_bf16=self._quant_keeps_bf16,
+            )
+            if fused is not None:
+                return fused
         return _forward_with_allreduce_fusion(
             self,
             x,
@@ -1285,6 +1366,14 @@ class GemmaRMSNorm(BaseFusedOp):
             self.gemma_weight,
             use_attn_tp_group=True,
         )
+
+    def fuse_input_quant(self, linear: nn.Module, keep_bf16: bool) -> None:
+        """Quantize the norm from forward_with_allreduce_fusion to FP8 with the
+        static per-tensor input_scale of ``linear``, its FP8 consumer, handing
+        on (fp8, scale), or (bf16, fp8, scale) with ``keep_bf16`` for the norm's
+        BF16 consumers. The projection stays out of this module's children."""
+        self.__dict__["_quant_linear"] = linear
+        self._quant_keeps_bf16 = keep_bf16
 
     def forward_with_allreduce_fusion_quant_per_group(
         self,

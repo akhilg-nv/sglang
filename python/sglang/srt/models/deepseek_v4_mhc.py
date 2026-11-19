@@ -669,10 +669,26 @@ def run_attn_post(
     if isinstance(out, AttnOutput):
         from sglang.kernels.ops.communication.all_reduce_mhc import (
             all_reduce_mhc_post_combine_norm,
+            all_reduce_mhc_post_combine_norm_quant,
         )
 
         assert next is not None
         pre, post_mix, comb = _compute_triplet(hc, residual, stats_stream, precomputed)
+        # The quant epilogue writes one 128-row scale tile.
+        if next.accepts_mxfp8 and 0 < out.partial.shape[0] <= 128:
+            _, updated, normalized, q, sf = all_reduce_mhc_post_combine_norm_quant(
+                out.partial,
+                residual,
+                post_mix,
+                comb,
+                pre,
+                next.norm.weight,
+                next.norm.variance_epsilon,
+                world_size=world_size,
+            )
+            return HcState(
+                updated, pre, HcQuantized(normalized, Mxfp8SwizzledInput(q, sf))
+            )
         _, updated, normalized = all_reduce_mhc_post_combine_norm(
             out.partial,
             residual,

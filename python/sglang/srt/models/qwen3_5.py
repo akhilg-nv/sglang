@@ -26,12 +26,18 @@ from safetensors.torch import load_file
 from transformers.utils import cached_file
 
 from sglang.kernels.ops.attention.fla.layernorm_gated import RMSNorm as RMSNormGated
-from sglang.kernels.ops.attention.fla.layernorm_gated import _layer_norm_fwd
+from sglang.kernels.ops.attention.fla.layernorm_gated import (
+    _layer_norm_fwd,
+    rms_norm_gated_static_fp8,
+)
 from sglang.kernels.ops.attention.triton_gdn_fused_proj import (
     fused_qkvzba_split_reshape_cat_contiguous,
     qwen3_5_gdn_prefill_projection_views,
 )
-from sglang.kernels.ops.elementwise.elementwise import fused_sigmoid_mul
+from sglang.kernels.ops.elementwise.elementwise import (
+    fused_sigmoid_mul,
+    fused_sigmoid_mul_static_fp8,
+)
 
 # Configs
 from sglang.srt.configs.model_config import (
@@ -307,12 +313,56 @@ if _is_npu:
     from sgl_kernel_npu.fla.utils import fused_qkvzba_split_reshape_cat_contiguous
 
 
+def _accepts_static_fp8_input(linear: nn.Module) -> bool:
+    """Whether ``linear`` takes an (fp8, scale) input quantized with its static
+    per-tensor input_scale, so its producer quantizes for it
+    (SGLANG_QWEN35_FUSE_FP8_INPUT_QUANT)."""
+    if not (_is_cuda and envs.SGLANG_QWEN35_FUSE_FP8_INPUT_QUANT.get()):
+        return False
+    from sglang.srt.layers.quantization.modelopt_quant import accepts_static_fp8_input
+
+    return accepts_static_fp8_input(linear)
+
+
+def _fuse_ffn_input_quant(layer: nn.Module) -> None:
+    """Hand the separate shared expert's projections inputs quantized by their
+    producers: the fused all-reduce + post-attention norm (whose BF16 output
+    the router, gates and routed experts keep reading) and the SiLU-mul."""
+    mlp = layer.mlp
+    if not isinstance(mlp, Qwen2MoeSparseMoeBlock) or mlp.shared_expert is None:
+        return
+    if _accepts_static_fp8_input(mlp.shared_expert.gate_up_proj):
+        layer.post_attention_layernorm.fuse_input_quant(
+            mlp.shared_expert.gate_up_proj, keep_bf16=True
+        )
+    if _accepts_static_fp8_input(mlp.shared_expert.down_proj):
+        mlp.shared_expert._fuse_silu_fp8_quant = True
+
+
+def _forward_ffn(mlp: nn.Module, hidden_states, forward_batch, ffn_exit):
+    if not isinstance(mlp, Qwen2MoeSparseMoeBlock):
+        return mlp(hidden_states)
+    shared_expert_input = None
+    if isinstance(hidden_states, tuple):
+        # (bf16, fp8, scale): the fused norm quantized the shared expert's input.
+        hidden_states, shared_expert_input = hidden_states[0], hidden_states[1:]
+    return mlp(
+        hidden_states,
+        forward_batch,
+        defer_finalize=ffn_exit.defer_moe_finalize,
+        shared_expert_input=shared_expert_input,
+    )
+
+
 def _linear_accepts_fp8_tuple(linear: nn.Module) -> bool:
     quant_method = getattr(linear, "quant_method", None)
-    return quant_method.__class__.__name__ == "Fp8LinearMethod" and (
-        getattr(quant_method, "block_quant", False)
-        or getattr(quant_method, "use_mxfp8", False)
-    )
+    return (
+        quant_method.__class__.__name__ == "Fp8LinearMethod"
+        and (
+            getattr(quant_method, "block_quant", False)
+            or getattr(quant_method, "use_mxfp8", False)
+        )
+    ) or _accepts_static_fp8_input(linear)
 
 
 def _fp8_tuple_input(linear: nn.Module, num_tokens: int) -> bool:
@@ -524,6 +574,7 @@ class Qwen3_5GatedDeltaNet(nn.Module):
             parallel_group=parallel_group,
             prefix=add_prefix("out_proj", prefix),
         )
+        self._out_proj_takes_fp8 = _accepts_static_fp8_input(self.out_proj)
 
     @staticmethod
     def _override_weight_loader(param, loader):
@@ -846,12 +897,11 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                         fused_out[:, : self._fused_in_proj_qkvz_width],
                         fused_out[:, self._fused_in_proj_qkvz_width :],
                     )
-        # AMD/aiter fused AR+RMSNorm+per-group-quant path ships a
-        # ``(bf16, fp8, scale)`` 3-tuple so the FP8 ``in_proj_qkvz`` can
-        # consume ``(fp8, scale)`` (skipping its internal quant) while the
-        # bf16 ``in_proj_ba`` consumes the unquantized bf16. Non-aiter runs skip
-        # the tuple branch and keep the original control flow below unchanged.
-        if _use_aiter and isinstance(hidden_states, tuple):
+        # The fused AR+RMSNorm+quant path (AMD/aiter per-group, or CUDA static
+        # per-tensor) ships a ``(bf16, fp8, scale)`` 3-tuple so the FP8
+        # ``in_proj_qkvz`` can consume ``(fp8, scale)`` (skipping its internal
+        # quant) while the bf16 ``in_proj_ba`` consumes the unquantized bf16.
+        if isinstance(hidden_states, tuple):
             return self._forward_input_proj_fused_quant_amd(hidden_states)
 
         if (
@@ -907,7 +957,8 @@ class Qwen3_5GatedDeltaNet(nn.Module):
         return projected_states_qkvz, projected_states_ba
 
     def _forward_input_proj_fused_quant_amd(self, hidden_states):
-        """AMD-only variant for the fused AR+RMSNorm+per-group-quant path.
+        """Variant for the fused AR+RMSNorm+quant path (AMD per-group, and the
+        CUDA static per-tensor path of SGLANG_QWEN35_FUSE_FP8_INPUT_QUANT).
 
         ``hidden_states`` is a ``(bf16, fp8, scale)`` 3-tuple produced by the
         upstream fused kernel. FP8 ``in_proj_qkvz`` takes ``(fp8, scale)``
@@ -1101,6 +1152,18 @@ class Qwen3_5GatedDeltaNet(nn.Module):
                 quant_heads=nv,
             )
             return self.out_proj(fp8)[0]
+        if self._out_proj_takes_fp8 and not get_forward().sp_active:
+            scale = self.out_proj.input_scale
+            fp8 = rms_norm_gated_static_fp8(
+                core_attn_out,
+                self.norm.weight,
+                z,
+                self.norm.eps,
+                self.norm.activation,
+                scale,
+            ).reshape(z_shape_og)
+            fp8 = fp8.reshape(*fp8.shape[:-2], fp8.shape[-2] * fp8.shape[-1])
+            return self.out_proj((fp8, scale))[0]
 
         core_attn_out = self.norm(core_attn_out, z)
         core_attn_out = core_attn_out.reshape(z_shape_og)
@@ -1179,6 +1242,11 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
+            if _accepts_static_fp8_input(self.linear_attn.in_proj_qkvz):
+                self.input_layernorm.fuse_input_quant(
+                    self.linear_attn.in_proj_qkvz, keep_bf16=True
+                )
+            _fuse_ffn_input_quant(self)
             attn, ffn = self.stage_facts(
                 config,
                 layer_id,
@@ -1217,14 +1285,9 @@ class Qwen3_5LinearDecoderLayer(nn.Module):
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    defer_finalize=ffn_exit.defer_moe_finalize,
-                )
-            else:
-                hidden_states = self.mlp(hidden_states)
+            hidden_states = _forward_ffn(
+                self.mlp, hidden_states, forward_batch, ffn_exit
+            )
         return ffn_exit.finish(hidden_states)
 
 
@@ -1257,6 +1320,8 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
     """Qwen3.5 Decoder Layer with Full Attention."""
 
     stage_facts = staticmethod(_qwen3_5_stage_facts)
+    # Subclasses with their own __init__ keep the unfused o_proj input.
+    _o_proj_takes_fp8 = False
 
     def __init__(
         self,
@@ -1405,6 +1470,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         boundary_fusions = _layer_fusions(config, is_nextn)
         # A subclass that brings its own residual builds the stages itself.
         if build_stages:
+            if _accepts_static_fp8_input(self.qkv_proj):
+                self.input_layernorm.fuse_input_quant(self.qkv_proj, keep_bf16=False)
+            _fuse_ffn_input_quant(self)
             attn, ffn = self.stage_facts(
                 config,
                 layer_id,
@@ -1416,6 +1484,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
                 (attn, self.input_layernorm, {"fusions": boundary_fusions}),
                 (ffn, self.post_attention_layernorm, {"fusions": boundary_fusions}),
             )
+        self._o_proj_takes_fp8 = _accepts_static_fp8_input(self.o_proj)
 
         self.alt_stream = alt_stream
 
@@ -1456,6 +1525,7 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
 
     def forward_prepare_cuda_fused(self, positions, hidden_states):
         """Fused QK GemmaRMSNorm + NeoX RoPE + gate deinterleave."""
+        hidden_states = _select_fused_ar_input_for_linear(hidden_states, self.qkv_proj)
         qkv, _ = self.qkv_proj(hidden_states)
         if self.attn_output_gate:
             q_gate, k, v = qkv.split(
@@ -1478,14 +1548,16 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
             has_gate=self.attn_output_gate,
             mrope_axis_map=(self.rotary_emb.axis_map if positions.dim() == 2 else None),
         )
-        seq_len = hidden_states.shape[0]
+        seq_len = (
+            hidden_states[0] if isinstance(hidden_states, tuple) else hidden_states
+        ).shape[0]
         q = q_out.view(seq_len, -1)
         k = k_out.view(seq_len, -1)
         gate = gate_out.view(seq_len, -1) if gate_out is not None else None
         return q, k, v, gate
 
     def forward_prepare_native(self, positions, hidden_states):
-        if _use_aiter and isinstance(hidden_states, tuple):
+        if isinstance(hidden_states, tuple):
             hidden_states = _select_fused_ar_input_for_linear(
                 hidden_states, self.qkv_proj
             )
@@ -1606,6 +1678,12 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         if self.attn_output_gate:
             if _fp8_tuple_input(self.o_proj, attn_output.shape[0]):
                 attn_output = fused_sigmoid_mul(attn_output, gate, quant=True)
+            elif self._o_proj_takes_fp8 and not get_forward().sp_active:
+                scale = self.o_proj.input_scale
+                attn_output = (
+                    fused_sigmoid_mul_static_fp8(attn_output, gate, scale),
+                    scale,
+                )
             elif not _is_npu:
                 attn_output = fused_sigmoid_mul(attn_output, gate, inplace=True)
             else:
@@ -1642,14 +1720,9 @@ class Qwen3_5AttentionDecoderLayer(nn.Module):
         hidden_states = self.attn_boundary.finish(hidden_states, forward_batch)
         hidden_states = self.ffn_boundary.prepare(hidden_states, forward_batch)
         with self.ffn_boundary.exit(forward_batch) as ffn_exit:
-            if isinstance(self.mlp, Qwen2MoeSparseMoeBlock):
-                hidden_states = self.mlp(
-                    hidden_states,
-                    forward_batch,
-                    defer_finalize=ffn_exit.defer_moe_finalize,
-                )
-            else:
-                hidden_states = self.mlp(hidden_states)
+            hidden_states = _forward_ffn(
+                self.mlp, hidden_states, forward_batch, ffn_exit
+            )
         return ffn_exit.finish(hidden_states)
 
 

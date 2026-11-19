@@ -352,16 +352,17 @@ class DeepseekMLAForwardMixin:
             )
             k_nope = latent_cache[..., : self.kv_lora_rank]
 
-            # overlap qk norm
+            # overlap qk norm; q_b_input: q_b_proj's (fp8, scale) input when
+            # the q_a norm quantized it, else None and q_b_proj reads q.
             if self.alt_stream is not None and get_is_capture_mode():
                 current_stream = torch.cuda.current_stream()
                 self.alt_stream.wait_stream(current_stream)
-                q = self.q_a_layernorm(q)
+                q, q_b_input = self.q_a_layernorm_forward(q)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = self.kv_a_layernorm(k_nope)
                 current_stream.wait_stream(self.alt_stream)
             else:
-                q = self.q_a_layernorm(q)
+                q, q_b_input = self.q_a_layernorm_forward(q)
                 k_nope = self.kv_a_layernorm(k_nope)
 
             # q_lora needed by indexer
@@ -381,7 +382,7 @@ class DeepseekMLAForwardMixin:
                 self.alt_stream.wait_stream(current_stream)
                 with torch.cuda.stream(self.alt_stream):
                     k_nope = k_nope.unsqueeze(1)
-                    q = self.q_b_proj_forward(q)
+                    q = self.q_b_proj_forward(q if q_b_input is None else q_b_input)
                 if self.should_run_indexer(prev_topk_indices):
                     topk_indices = self.indexer(
                         x=hidden_states,
@@ -407,7 +408,7 @@ class DeepseekMLAForwardMixin:
                         self.qk_head_dim,
                     )
                 else:
-                    q = self.q_b_proj_forward(q)
+                    q = self.q_b_proj_forward(q if q_b_input is None else q_b_input)
 
                 # Hoist these above the DSA indexer split op so the indexer
                 # and the composite bmm+attention split op are adjacent in FX.

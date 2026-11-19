@@ -52,6 +52,10 @@ from sglang.srt.layers.layer_boundary import (
     is_dense_ffn_fully_dp,
 )
 from sglang.srt.layers.layer_boundary.residual import batch as residual_batch
+from sglang.srt.layers.layer_boundary.residual.add_norm import (
+    NORM_MXFP8_READOUT,
+    NORM_READOUT,
+)
 from sglang.srt.layers.layernorm import GemmaRMSNorm, RMSNorm
 from sglang.srt.layers.linear import (
     LinearParallelGroup,
@@ -356,12 +360,22 @@ class MiniMaxM3MLP(nn.Module):
             )
         return None
 
+    def _gate_up_input(self, x):
+        """x, or the MXFP8 quantization of x the FFN norm kernel wrote with it
+        (SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT, NormMxfp8Readout)."""
+        if torch.compiler.is_compiling() or get_forward().sp_active:
+            return x
+        operand = getattr(x, "mxfp8_operand", None)
+        if operand is None or not accepts_mxfp8_swizzled_input(self.gate_up_proj):
+            return x
+        return operand
+
     def forward(
         self,
         x,
         forward_batch: Optional[ForwardBatch] = None,
     ):
-        gate_up, _ = self.gate_up_proj(x)
+        gate_up, _ = self.gate_up_proj(self._gate_up_input(x))
         x = self._swiglu_oai_mxfp8(gate_up)
         if x is None:
             x = self.act_fn(gate_up)
@@ -1331,6 +1345,18 @@ class MiniMaxM3Attention(nn.Module):
             inner_state = (q, k, v, forward_batch)
         return None, forward_batch, inner_state
 
+    def accepts_mxfp8_input(self) -> bool:
+        """Whether every projection of the layer input (qkv_proj, and index_qkv_proj
+        or the fused projection built from both) takes an Mxfp8SwizzledInput."""
+        cached = getattr(self, "_accepts_mxfp8_input", None)
+        if cached is None:
+            linears = [self.qkv_proj]
+            if self.is_sparse_attention_layer:
+                linears.append(self.index_qkv_proj)
+            cached = all(accepts_mxfp8_swizzled_input(linear) for linear in linears)
+            self._accepts_mxfp8_input = cached
+        return cached
+
     def forward_prepare(
         self,
         positions: torch.Tensor,
@@ -1574,6 +1600,12 @@ class MiniMaxM3DecoderLayer(nn.Module):
             declare_ffn(
                 sparse=cls._is_layer_sparse(config, layer_id),
                 next_layer_sparse=cls._is_next_layer_sparse(config, layer_id),
+                # The shared expert or dense MLP gate_up takes the norm's MXFP8 rows.
+                read=(
+                    NORM_MXFP8_READOUT
+                    if _is_cuda and envs.SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT.get()
+                    else NORM_READOUT
+                ),
             ),
         )
 
@@ -1592,6 +1624,23 @@ class MiniMaxM3DecoderLayer(nn.Module):
             return True
         return moe_layer_freq[lid] != 0
 
+    def _attn_quant_format(self, forward_batch: ForwardBatch) -> str:
+        """SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT: at decode and verify the input norm
+        quantizes for the attention's MXFP8 projections in the same kernel, when
+        the attention takes the norm's rows as they are (a gather of the swizzled
+        scales would not be their layout)."""
+        mode = forward_batch.forward_mode
+        if not (
+            _is_cuda
+            and envs.SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT.get()
+            and (mode.is_decode() or mode.is_target_verify())
+            and self.self_attn.accepts_mxfp8_input()
+        ):
+            return ""
+        if self.attn_boundary.entry(forward_batch).input_move is not None:
+            return ""
+        return "mxfp8"
+
     def forward(
         self,
         positions: torch.Tensor,
@@ -1604,10 +1653,11 @@ class MiniMaxM3DecoderLayer(nn.Module):
             hidden_states,
             forward_batch,
             capture_gathered=captured_last_layer_outputs,
+            quant_format=self._attn_quant_format(forward_batch),
             **kwargs,
         )
 
-        if hidden_states.shape[0] != 0:
+        if isinstance(hidden_states, Mxfp8SwizzledInput) or hidden_states.shape[0] != 0:
             hidden_states = self.self_attn(
                 positions=positions,
                 hidden_states=hidden_states,

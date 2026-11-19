@@ -100,19 +100,35 @@ class AttnBankState:
     # The bank stays on each rank's attention-TP slice across layers;
     # otherwise every rank writes every row and the attention reads them all.
     reads_slices: bool = False
+    # The static per-tensor FP8 projection that reads the attention input
+    # (SGLANG_K3_FUSE_FP8_INPUT_QUANT). Each attention read sets its
+    # static_fp8_input: (normed, fp8, input_scale) when the fast kernel also
+    # quantized the input with its input_scale (every row of the bank, SM100+),
+    # else None. The BF16 normed is what the read returns either way.
+    attn_input_quant: Optional[torch.nn.Module] = None
 
     def _aggregate(
-        self, contribution, residual, norm, *, score_proj, score_norm, write
+        self,
+        contribution,
+        residual,
+        norm,
+        *,
+        score_proj,
+        score_norm,
+        write,
+        fp8_scale=None,
     ):
         bank = self.bank.require()
+        rows = _bank_rows(bank, contribution)
         return bank.forward(
             contribution,
             residual,
             score_proj,
             score_norm,
             norm,
-            rows=_bank_rows(bank, contribution),
+            rows=rows,
             write=write,
+            fp8_scale=fp8_scale if rows is None else None,
         )
 
     def read_attn_input(self, residual, norm):
@@ -124,6 +140,7 @@ class AttnBankState:
         return self._attn_aggregate(contribution, residual, norm)
 
     def _attn_aggregate(self, contribution, residual, norm):
+        quant = self.attn_input_quant
         normed, residual = self._aggregate(
             contribution,
             residual,
@@ -131,7 +148,13 @@ class AttnBankState:
             score_proj=self.attn_score_proj,
             score_norm=self.attn_score_norm,
             write=self.writes_block,
+            fp8_scale=None if quant is None else quant.input_scale,
         )
+        if quant is not None:
+            quant.static_fp8_input = None
+            if isinstance(normed, tuple):
+                normed, fp8 = normed
+                quant.static_fp8_input = (normed, fp8, quant.input_scale)
         return normed, None if self.writes_block else residual
 
     def update_and_read_ffn_input(self, contribution, residual, norm):

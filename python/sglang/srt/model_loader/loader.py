@@ -214,6 +214,8 @@ def _get_quantization_config(
         # (yizhang2077) workaround for nvidia/Llama-4-Maverick-17B-128E-Eagle3
         if quant_config is None:
             return None
+        # Read by the online-quantization paths in modelopt_quant: a draft model always keeps its shipped precision.
+        quant_config.is_draft_model = model_config.is_draft_model
         from sglang.srt.layers.quantization.fp8 import Fp8Config
 
         if isinstance(quant_config, Fp8Config):

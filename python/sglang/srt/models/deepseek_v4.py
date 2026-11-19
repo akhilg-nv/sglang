@@ -99,7 +99,10 @@ from sglang.srt.layers.quantization.fp8_utils import (
     Mxfp8DenseGemmBackend,
     view_aiter_fused_rms_transposed_fp8_scale,
 )
-from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    accepts_mxfp8_swizzled_input,
+)
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import VocabParallelEmbedding
@@ -549,6 +552,12 @@ def _apply_wo_a_bf16_matmul(
                 err,
             )
     return torch.einsum("tgd,grd->tgr", o, wo_a)
+
+
+def _q_lora_mxfp8_max_rows() -> int:
+    """The q_lora rows the norm quantizes for wq_b itself: the speculative BS=1
+    shapes, or every row count of one scale tile (SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT)."""
+    return 128 if envs.SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT.get() else 8
 
 
 def _fused_rmsnorm_fp8_quant(hidden_states, weight, eps, e8m0: bool = False):
@@ -1522,7 +1531,7 @@ class MQALayer(MqaAttentionBase):
             and get_platform().is_blackwell
             and q.dtype == self.q_norm.weight.dtype == torch.bfloat16
             and q.ndim == 2
-            and 0 < q.shape[0] <= 8
+            and 0 < q.shape[0] <= _q_lora_mxfp8_max_rows()
             and q.shape[1] == 1280
             and q.stride(1) == 1
             and getattr(method, "mxfp8_dense_backend", None)
@@ -3108,6 +3117,19 @@ class DeepseekV4DecoderLayerBase(nn.Module):
         self.__dict__.pop("_can_fuse_attn_mhc", None)
         self.__dict__.pop("_can_fuse_ffn_mhc", None)
 
+    def ffn_accepts_mxfp8_swizzled_input(self) -> bool:
+        """Whether the shared expert's gate_up takes its input as a 128x4 MXFP8 tuple
+        from the read of the FFN input (SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT; a draft
+        layer keeps its own quantization)."""
+        shared = getattr(self.mlp, "shared_experts", None)
+        return bool(
+            _is_cuda
+            and envs.SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT.get()
+            and not self.mlp.is_nextn
+            and shared is not None
+            and accepts_mxfp8_swizzled_input(shared.gate_up_proj)
+        )
+
     def _input_norm(
         self,
         hidden_states: torch.Tensor,
@@ -3400,6 +3422,13 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
         hidden_states = self.ffn_boundary.prepare(
             hidden_states, forward_batch, read_context=call
         )
+        # The FFN read's MXFP8 rows, for the shared expert, while the transport kept them.
+        shared_quantized = residual_batch.written_residual(forward_batch).quantized
+        if (
+            shared_quantized is not None
+            and shared_quantized.data.shape[0] != hidden_states.shape[0]
+        ):
+            shared_quantized = None
         transport = self.ffn_boundary.transport_context(forward_batch)
         with self.ffn_boundary.exit(forward_batch) as output:
             hidden_states = self.mlp(
@@ -3410,6 +3439,7 @@ class DeepseekV4CudaDecoderLayer(DeepseekV4DecoderLayerBase):
                 skip_shared_experts=transport.do_shared_local,
                 return_moe_output=transport.return_moe_output,
                 leave_output_sum=True,
+                shared_experts_input=shared_quantized,
             )
             return output.finish(hidden_states)
 

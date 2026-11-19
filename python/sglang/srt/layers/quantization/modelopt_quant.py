@@ -65,10 +65,11 @@ from sglang.srt.layers.quantization.utils import (
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.utils import alias_or_bind_derived_param, copy_or_rebind_param
-from sglang.srt.runtime_context import get_platform
+from sglang.srt.runtime_context import get_lora, get_platform
 from sglang.srt.utils.common import (
     get_device_capability,
     is_cuda,
+    log_info_on_rank0,
     round_up,
     set_weight_attrs,
 )
@@ -312,6 +313,73 @@ def _compile_exclusion_pattern(pattern: str) -> re.Pattern[str]:
     return re.compile(pattern.replace(".", r"\.").replace("*", r".*"))
 
 
+def _bf16_linear_method(
+    layer: torch.nn.Module, prefix: str, packed_modules_mapping, is_draft: bool = False
+) -> QuantizeMethodBase:
+    """Method for a linear the checkpoint left in BF16: unquantized, or online MXFP8 when
+    SGLANG_MODELOPT_BF16_LINEAR_MXFP8_REGEX matches its prefix. Draft models (MTP / NextN / EAGLE heads) are never
+    quantized online: they must run at the precision they ship in."""
+    from sglang.srt.layers.linear import LinearBase
+
+    if is_draft:
+        return UnquantizedLinearMethod()
+    pattern = envs.SGLANG_MODELOPT_BF16_LINEAR_MXFP8_REGEX.get()
+    if pattern and isinstance(layer, LinearBase) and re.search(pattern, prefix):
+        from sglang.srt.layers.quantization import online_static_fp8
+
+        if dump := envs.SGLANG_MODELOPT_BF16_LINEAR_CALIB_DUMP.get():
+            return online_static_fp8.CalibratingLinearMethod(prefix, dump)
+        if amax_path := envs.SGLANG_MODELOPT_BF16_LINEAR_FP8_AMAX.get():
+            nvfp4 = envs.SGLANG_MODELOPT_BF16_LINEAR_NVFP4.get()
+            make = (
+                online_static_fp8.static_nvfp4_method
+                if nvfp4
+                else online_static_fp8.static_fp8_method
+            )
+            method = make(prefix, amax_path)
+            if method is not None:
+                fmt = "NVFP4" if nvfp4 else "static FP8"
+                log_info_on_rank0(logger, f"Calibrated {fmt} for BF16 linear {prefix}")
+                return method
+            # A matched layer without an amax means the calibration run missed it: fail rather than silently run BF16.
+            raise ValueError(f"no calibrated amax for {prefix} in {amax_path}")
+        log_info_on_rank0(logger, f"Online MXFP8 for BF16 linear {prefix}")
+        return Fp8LinearMethod(
+            Fp8Config(
+                is_checkpoint_fp8_serialized=False,
+                use_mxfp8=True,
+                packed_modules_mapping=packed_modules_mapping,
+            )
+        )
+    return UnquantizedLinearMethod()
+
+
+def _block_fp8_linear_method(
+    prefix: str, block_config, is_draft: bool = False
+) -> QuantizeMethodBase:
+    """Block-FP8 checkpoint linear, or (SGLANG_MODELOPT_BLOCK_FP8_PER_TENSOR_REGEX) calibration / static per-tensor FP8.
+    Draft models always keep the checkpoint's block FP8."""
+    method = Fp8LinearMethod(block_config)
+    pattern = envs.SGLANG_MODELOPT_BLOCK_FP8_PER_TENSOR_REGEX.get()
+    if pattern and not is_draft and re.search(pattern, prefix):
+        from sglang.srt.layers.quantization import online_static_fp8
+
+        if dump := envs.SGLANG_MODELOPT_BF16_LINEAR_CALIB_DUMP.get():
+            return online_static_fp8.CalibratingWrapper(method, prefix, dump)
+        if amax_path := envs.SGLANG_MODELOPT_BF16_LINEAR_FP8_AMAX.get():
+            converted = online_static_fp8.block_fp8_as_tensor_method(
+                method, prefix, amax_path
+            )
+            if converted is not None:
+                log_info_on_rank0(
+                    logger,
+                    f"Block FP8 -> calibrated static per-tensor FP8 for {prefix}",
+                )
+                return converted
+            raise ValueError(f"no calibrated amax for {prefix} in {amax_path}")
+    return method
+
+
 class ModelOptQuantConfig(QuantizationConfig):
     def __init__(
         self,
@@ -341,7 +409,12 @@ class ModelOptQuantConfig(QuantizationConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return _bf16_linear_method(
+                    layer,
+                    prefix,
+                    self.packed_modules_mapping,
+                    getattr(self, "is_draft_model", False),
+                )
             return Linear(self)
         elif self.kv_cache_quant_algo and isinstance(layer, RadixAttention):
             return ModelOptFp8KVCacheMethod(self)
@@ -647,6 +720,28 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
         bias: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
         """Applies FP8 linear transformation."""
+        if isinstance(x, tuple):
+            # (fp8, input_scale): the producer fused this layer's static input
+            # quant (see accepts_static_fp8_input); not on marlin or SM12x.
+            qx, x_scale = x
+            if layer.use_flashinfer_bmm:
+                return apply_fp8_linear_bmm_flashinfer(
+                    input=qx,
+                    weight=layer.weight,
+                    weight_scale=layer.weight_scale,
+                    input_scale=x_scale,
+                    bias=bias,
+                    pre_quant_output_dtype=layer.orig_dtype,
+                )
+            return apply_fp8_linear(
+                input=qx,
+                weight=layer.weight,
+                weight_scale=layer.weight_scale,
+                input_scale=x_scale,
+                bias=bias,
+                cutlass_fp8_supported=self.cutlass_fp8_supported,
+                pre_quant_output_dtype=layer.orig_dtype,
+            )
         if self.use_marlin:
             return torch.ops.sglang.apply_fp8_marlin_linear(
                 input=x,
@@ -685,6 +780,22 @@ class ModelOptFp8LinearMethod(LinearMethodBase):
             bias=bias,
             cutlass_fp8_supported=self.cutlass_fp8_supported,
         )
+
+
+def accepts_static_fp8_input(linear: torch.nn.Module) -> bool:
+    """Whether ``linear`` takes an (fp8, scale) input already quantized with its
+    static per-tensor input_scale (see ModelOptFp8LinearMethod.apply), so that
+    its producer may quantize for it. process_weights_after_loading reduces the
+    input_scale to a scalar, which the producers' fused kernels require."""
+    quant_method = linear.quant_method
+    return (
+        is_cuda()
+        and isinstance(quant_method, ModelOptFp8LinearMethod)
+        and not quant_method.use_marlin
+        and not quant_method.use_sm120_fp8
+        # LoRA wraps the Linear modules and passes them a BF16 input.
+        and not (get_lora().enable_lora or get_lora().lora_paths)
+    )
 
 
 class ModelOptFp8KVCacheMethod(BaseKVCacheMethod):
@@ -1048,18 +1159,32 @@ class ModelOptMixedPrecisionConfig(ModelOptQuantConfig):
             if is_layer_skipped(
                 prefix, self.exclude_modules, self.packed_modules_mapping
             ) or self.is_layer_excluded(prefix):
-                return UnquantizedLinearMethod()
+                return _bf16_linear_method(
+                    layer,
+                    prefix,
+                    self.packed_modules_mapping,
+                    getattr(self, "is_draft_model", False),
+                )
             if quant_algo == "FP8":
                 return ModelOptFp8LinearMethod(self.fp8_config)
             if quant_algo in _BLOCK_FP8_ALGOS:
-                return Fp8LinearMethod(self.fp8_block_config)
+                return _block_fp8_linear_method(
+                    prefix,
+                    self.fp8_block_config,
+                    getattr(self, "is_draft_model", False),
+                )
             if quant_algo == "MXFP8":
                 return Fp8LinearMethod(self.mxfp8_config)
             if quant_algo == "NVFP4":
                 return ModelOptFp4LinearMethod(self.nvfp4_config)
             if quant_algo == "W4A16_NVFP4":
                 return ModelOptNvFp4A16LinearMethod(self.nvfp4a16_config)
-            return UnquantizedLinearMethod()
+            return _bf16_linear_method(
+                layer,
+                prefix,
+                self.packed_modules_mapping,
+                getattr(self, "is_draft_model", False),
+            )
 
         # Must stay after the ParallelLMHead branch: ParallelLMHead subclasses
         # VocabParallelEmbedding, and a tied lm_head IS the embedding module.

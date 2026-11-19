@@ -16,7 +16,7 @@
 # aggregate_stream_torch is the eager reference (tests and the
 # H % _BLOCK_H != 0 shape fallback of aggregate_stream).
 
-from typing import Optional
+from typing import Optional, Union
 
 import torch
 import triton
@@ -91,12 +91,15 @@ def _aggregate_fast(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
-) -> torch.Tensor:
+    fp8_scale: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Warp-specialized TMA kernel: online softmax over row chunks with the
     output RMSNorm fused, one persistent CTA per SM, per-nvb tuned launch
     config (GB300 benchmark winner across nvb). With write_bank_row the kernel
     also snapshots the prefix row into bank[:, nvb, :] (bit-exact, zero extra
-    reads — the row streams through the score pass anyway)."""
+    reads — the row streams through the score pass anyway). With fp8_scale it
+    also writes the output quantized to FP8 with that static per-tensor scale
+    and returns (out, out_fp8)."""
     from sglang.kernels.ops.attention.attn_res import attn_res_fused_tma
 
     # The kernel applies one eps to both the score norm and the output norm.
@@ -104,6 +107,11 @@ def _aggregate_fast(
 
     cw = get_cw(score_proj, score_norm, dtype=torch.bfloat16)
     out = torch.empty_like(prefix_sum)
+    out_fp8 = (
+        None
+        if fp8_scale is None
+        else torch.empty_like(prefix_sum, dtype=torch.float8_e4m3fn)
+    )
     attn_res_fused_tma(
         prefix_sum,
         bank,
@@ -113,8 +121,10 @@ def _aggregate_fast(
         nvb,
         score_norm.variance_epsilon,
         write_prefix=write_bank_row,
+        out_fp8=out_fp8,
+        fp8_scale=fp8_scale,
     )
-    return out
+    return out if out_fp8 is None else (out, out_fp8)
 
 
 @triton.jit
@@ -366,10 +376,11 @@ def _aggregate_fused_add(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
+    fp8_scale: Optional[torch.Tensor] = None,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Aggregation point with a pending upstream residual add: materialize
     prefix = prefix_a + prefix_b, then aggregate. Returns (normed, prefix).
-    write_bank_row rides _aggregate (fast path only)."""
+    write_bank_row and fp8_scale ride _aggregate (fast path only)."""
     if _use_hip_fused(prefix_a.shape[1], nvb):
         # The hip kernel reads the prefix row anyway, so the add folds into it.
         return _aggregate_hip(
@@ -392,6 +403,7 @@ def _aggregate_fused_add(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            fp8_scale=fp8_scale,
         ),
         prefix,
     )
@@ -405,13 +417,16 @@ def _aggregate(
     score_norm: RMSNorm,
     out_norm: RMSNorm,
     write_bank_row: bool = False,
-) -> torch.Tensor:
+    fp8_scale: Optional[torch.Tensor] = None,
+) -> Union[torch.Tensor, tuple[torch.Tensor, torch.Tensor]]:
     """Single aggregation point: score → softmax → mix → norm.
 
     Caller handles nvb == 0 (layer 0 attn side: just out_norm(prefix_sum)).
     write_bank_row is fast-path only (in-kernel snapshot of the prefix row
     into bank[:, nvb, :]); the triton path keeps the standalone .write() copy —
-    the caller (AttnResidual.forward) owns that fallback.
+    the caller (AttnResidual.forward) owns that fallback. fp8_scale is
+    fast-path only too: there the result is (normed, normed quantized to FP8
+    with that static scale); every other path returns the BF16 normed alone.
     """
     if prefix_sum.shape[0] == 0:
         return prefix_sum
@@ -424,6 +439,7 @@ def _aggregate(
             score_norm,
             out_norm,
             write_bank_row=write_bank_row,
+            fp8_scale=fp8_scale,
         )
     if _use_hip_fused(prefix_sum.shape[1], nvb):
         return _aggregate_hip(
@@ -490,11 +506,15 @@ class AttnResidual:
         out_norm: RMSNorm,
         rows: Optional[slice] = None,
         write: bool = False,
+        fp8_scale: Optional[torch.Tensor] = None,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Aggregate; with write=True also snapshot the aggregated prefix
         (the second return value) into the next bank row — fused into the
         fast kernel (the row streams through its score pass anyway), a
-        standalone .write() copy on every other path."""
+        standalone .write() copy on every other path. With fp8_scale, the
+        fast kernel also quantizes the normed output to FP8 with that static
+        per-tensor scale and the first return value is (normed, fp8); every
+        other path returns the BF16 normed as without it."""
         if rows is None and self.written_on_slice:
             raise RuntimeError(
                 "a read of every row after a write of this rank's slice of "
@@ -530,6 +550,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                fp8_scale=fp8_scale,
             )
             prefix = hidden_states
         else:
@@ -543,6 +564,7 @@ class AttnResidual:
                 score_norm,
                 out_norm,
                 write_bank_row=fused_write,
+                fp8_scale=fp8_scale,
             )
         if fused_write:
             self._count_write(rows)  # row nvb written in-kernel

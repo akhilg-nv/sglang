@@ -20,6 +20,7 @@ from typing import Optional
 
 import torch
 
+from sglang.srt.environ import envs
 from sglang.srt.layers.dp_attention import is_dp_attention_enabled
 from sglang.srt.layers.flashinfer_comm_fusion import (
     is_flashinfer_allreduce_unavailable,
@@ -37,6 +38,7 @@ from sglang.srt.layers.quantization.fp8_utils import (
     materialize_bpreshuffle_fp8_scale_tuple,
     view_aiter_fused_rms_transposed_fp8_scale_tuple,
 )
+from sglang.srt.layers.quantization.mxfp8_input import Mxfp8SwizzledInput
 from sglang.srt.model_executor.forward_batch_info import ForwardBatch, ForwardMode
 from sglang.srt.runtime_context import get_exec, get_parallel, get_platform
 from sglang.srt.utils import (
@@ -256,11 +258,66 @@ def _update_and_read_residual_aiter_fp8_per_token(
     )
 
 
+def _mxfp8_norm_applies(norm, hidden_states, residual) -> bool:
+    """Whether add_rmsnorm_mxfp8 can stand in for ``norm``'s CUDA add + RMSNorm
+    (SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT)."""
+    from sglang.srt.batch_invariant_ops import is_batch_invariant_mode_enabled
+    from sglang.srt.layers.layernorm import RMSNorm
+
+    return (
+        _is_cuda
+        and envs.SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT.get()
+        and type(norm) is RMSNorm
+        and not norm.cast_x_before_out_mul
+        and norm.variance_size_override is None
+        and norm.weight.dtype == hidden_states.dtype == torch.bfloat16
+        and hidden_states.dim() == 2
+        and hidden_states.shape[0] > 0
+        and hidden_states.shape[1] % 128 == 0
+        and hidden_states.stride(1) == 1
+        and (residual is None or residual.stride(1) == 1)
+        and not is_batch_invariant_mode_enabled()
+        and not torch.compiler.is_compiling()
+    )
+
+
+def _add_rmsnorm_mxfp8(norm, hidden_states, residual, *, store_y):
+    from sglang.kernels.ops.layernorm.mxfp8_epilogue import add_rmsnorm_mxfp8
+
+    y, q, s = add_rmsnorm_mxfp8(
+        hidden_states,
+        residual,
+        norm.weight.data,
+        norm.variance_epsilon,
+        store_y=store_y,
+    )
+    return y, Mxfp8SwizzledInput(q, s)
+
+
+def _update_and_read_residual_mxfp8(
+    norm, hidden_states, residual, post_residual_addition
+):
+    """The add + RMSNorm with the MXFP8 quantization of its output in the same
+    kernel, for a projection that takes an Mxfp8SwizzledInput; the plain read
+    where that kernel does not apply."""
+    if not _mxfp8_norm_applies(norm, hidden_states, residual):
+        return _update_and_read_residual_plain(
+            norm, hidden_states, residual, post_residual_addition
+        )
+    if residual is not None and post_residual_addition is not None:
+        # Where RMSNorm.forward_cuda adds it.
+        residual = residual + post_residual_addition
+    _, quantized = _add_rmsnorm_mxfp8(norm, hidden_states, residual, store_y=False)
+    return quantized, hidden_states if residual is None else residual
+
+
 def _norm_quant_kernel(quant_format: str):
     """Add the previous layer's output to the residual and read the attention
     input from it: the input norm, fused with the quantization this format
     wants. Without a residual (the first layer, or one already folded into
     hidden_states) the input itself becomes the residual."""
+    if quant_format == "mxfp8":
+        return _update_and_read_residual_mxfp8
     if _use_aiter and _is_gfx95_supported and "mxfp4" in quant_format:
         return _update_and_read_residual_aiter_mxfp4
     if _use_aiter and _is_gfx95_supported and quant_format == "fp8":
@@ -447,11 +504,62 @@ class UnfusedNormReadout(NormReadout):
         return self.read(hidden_states, norm, quant_format, post_residual_addition)
 
 
+@dataclass(frozen=True)
+class NormMxfp8Readout(NormReadout):
+    """NormReadout whose norm kernel also writes the MXFP8 quantization of the
+    rows it returns, as ``rows.mxfp8_operand`` (an Mxfp8SwizzledInput), for an
+    FFN whose MXFP8 projection takes it while the rest of the FFN reads the
+    BF16 rows (SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT). A copy of the rows drops it,
+    and the projection then quantizes them itself."""
+
+    bind = None
+
+    def read(self, residual, norm, quant_format="", post_residual_addition=None):
+        if (
+            quant_format
+            or post_residual_addition is not None
+            or not _mxfp8_norm_applies(norm, residual, None)
+        ):
+            return super().read(residual, norm, quant_format, post_residual_addition)
+        y, quantized = _add_rmsnorm_mxfp8(norm, residual, None, store_y=True)
+        y.mxfp8_operand = quantized
+        return y, residual
+
+    def update_and_read(
+        self,
+        update,
+        hidden_states,
+        residual,
+        norm,
+        quant_format="",
+        post_residual_addition=None,
+    ):
+        if (
+            residual is None
+            or not update.is_plain_add
+            or quant_format
+            or post_residual_addition is not None
+            or not _mxfp8_norm_applies(norm, hidden_states, residual)
+        ):
+            return super().update_and_read(
+                update,
+                hidden_states,
+                residual,
+                norm,
+                quant_format,
+                post_residual_addition,
+            )
+        y, quantized = _add_rmsnorm_mxfp8(norm, hidden_states, residual, store_y=True)
+        y.mxfp8_operand = quantized
+        return y, residual
+
+
 PLAIN_ADD = PlainAdd()
 REPLACE_AT_EXIT = ReplaceAtExit()
 NORM_QUANT_READOUT = NormQuantReadout()
 NORM_READOUT = NormReadout()
 UNFUSED_NORM_READOUT = UnfusedNormReadout()
+NORM_MXFP8_READOUT = NormMxfp8Readout()
 # A plain residual: the attention reads with its input norm and the quantization
 # it wants, the FFN with its norm, and each stage's output is added.
 PLAIN_RESIDUAL_OPS = LayerResidualOps(

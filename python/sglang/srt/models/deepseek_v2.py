@@ -47,6 +47,11 @@ from sglang.kernels.ops.moe.dsv4 import (
 from sglang.kernels.ops.quantization.fp8_kernel import (
     create_per_token_group_quant_fp8_output_scale,
 )
+from sglang.kernels.ops.quantization.mxfp8_swizzled_triton import (
+    can_use_silu_mul_mxfp8,
+    silu_mul_clamp_mxfp8,
+    silu_mul_mxfp8,
+)
 from sglang.srt.batch_overlap.single_batch_overlap import SboFlags, compute_overlap_args
 from sglang.srt.batch_overlap.two_batch_overlap import (
     MaybeTboDeepEPDispatcher,
@@ -143,6 +148,10 @@ from sglang.srt.layers.quantization.mxfp4_flashinfer_trtllm_moe import (
     Mxfp8RoutedInputPreQuant,
     maybe_fuse_routed_scale_and_shared_add,
     routed_hidden_size,
+)
+from sglang.srt.layers.quantization.mxfp8_input import (
+    Mxfp8SwizzledInput,
+    accepts_mxfp8_swizzled_input,
 )
 from sglang.srt.layers.radix_attention import RadixAttention
 from sglang.srt.layers.rotary_embedding import get_rope_wrapper
@@ -245,7 +254,9 @@ else:
     _hip_moe = None
 
 if _is_cuda:
+    from sglang.kernels.ops.elementwise.elementwise import silu_and_mul_static_fp8
     from sglang.kernels.ops.gemm.tiny_gemm import tiny_gemm_bf16
+    from sglang.kernels.ops.layernorm.rmsnorm_static_fp8 import rmsnorm_static_fp8
 elif _is_npu:
     from sglang.srt.hardware_backend.npu.modules.deepseek_v2_attention_mla_npu import (
         forward_dsa_core_npu,
@@ -274,7 +285,25 @@ _enable_pcg_dsv2_dual_stream = (
 _hip_shared_act_mxfp8 = _is_hip and envs.SGLANG_HIP_SHARED_ACT_MXFP8.get()
 
 
+def _accepts_static_fp8_input(linear: nn.Module) -> bool:
+    """Whether ``linear`` takes an (fp8, scale) input quantized with its static
+    per-tensor input_scale, so its producer quantizes for it
+    (SGLANG_GLM_FUSE_FP8_INPUT_QUANT)."""
+    if not (_is_cuda and envs.SGLANG_GLM_FUSE_FP8_INPUT_QUANT.get()):
+        return False
+    from sglang.srt.layers.quantization.modelopt_quant import accepts_static_fp8_input
+
+    return accepts_static_fp8_input(linear)
+
+
 class DeepseekV2MLP(nn.Module):
+    # Set by DeepseekV2DecoderLayer when down_proj takes the (fp8, scale) of
+    # SiLU-and-mul (SGLANG_GLM_FUSE_FP8_INPUT_QUANT).
+    _down_takes_static_fp8 = False
+    # Set by DeepseekV2MoE on a target model's shared experts: the clamped
+    # SiLU-and-mul may quantize for an MXFP8 down_proj (SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT).
+    _clamp_act_takes_mxfp8 = False
+
     def __init__(
         self,
         hidden_size: int,
@@ -479,13 +508,52 @@ class DeepseekV2MLP(nn.Module):
                     interleaved=False,
                 )
             else:
-                M, N = gate_up.shape
-                x = gate_up.new_empty((M, N // 2))
-                silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+                x = self._silu_mul_clamp_mxfp8(gate_up)
+                if x is None:
+                    M, N = gate_up.shape
+                    x = gate_up.new_empty((M, N // 2))
+                    silu_and_mul_clamp(gate_up, x, float(self.swiglu_limit))
+        elif (
+            self._down_takes_static_fp8
+            and gate_up.shape[0] > 0
+            and not get_forward().sp_active
+        ):
+            scale = self.down_proj.input_scale
+            x = (silu_and_mul_static_fp8(gate_up, scale), scale)
         else:
-            x = self.act_fn(gate_up)
+            x = self._silu_mul_mxfp8(gate_up)
+            if x is None:
+                x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
         return x
+
+    def _silu_mul_mxfp8(self, gate_up: torch.Tensor):
+        """SiLU-and-mul with the MXFP8 activation quant of an MXFP8 down_proj fused in (one kernel instead of two)."""
+        if not (
+            _is_cuda
+            and gate_up.shape[0] > 0
+            and accepts_mxfp8_swizzled_input(self.down_proj)
+            and not get_forward().sp_active
+            and can_use_silu_mul_mxfp8(gate_up)
+        ):
+            return None
+        return Mxfp8SwizzledInput(*silu_mul_mxfp8(gate_up))
+
+    def _silu_mul_clamp_mxfp8(self, gate_up: torch.Tensor):
+        """silu_and_mul_clamp with the MXFP8 activation quant of an MXFP8 down_proj
+        fused in (SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT)."""
+        if not (
+            self._clamp_act_takes_mxfp8
+            and envs.SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT.get()
+            and gate_up.shape[0] > 0
+            and accepts_mxfp8_swizzled_input(self.down_proj)
+            and not get_forward().sp_active
+            and can_use_silu_mul_mxfp8(gate_up)
+        ):
+            return None
+        return Mxfp8SwizzledInput(
+            *silu_mul_clamp_mxfp8(gate_up, float(self.swiglu_limit))
+        )
 
 
 class MoEGate(nn.Module):
@@ -835,6 +903,8 @@ class DeepseekV2MoE(nn.Module):
                 prefix=add_prefix("shared_experts", prefix),
                 parallel_group="replicated" if _shared_expert_use_tp1 else "tp",
             )
+            # A draft (NextN / DSpark stage) keeps its unfused activation kernels.
+            self.shared_experts._clamp_act_takes_mxfp8 = not is_nextn
             # Flags must be set before weight load so
             # process_weights_after_loading sees them and builds the
             # [Up, Gate]-interleaved weight + scale.
@@ -990,12 +1060,15 @@ class DeepseekV2MoE(nn.Module):
         skip_shared_experts: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
+        shared_experts_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, MoEOutput]:
         """``return_moe_output`` asks for the pieces unmerged, as `MoEOutput`; only
         the TP paths honor it. Distinct from `get_forward().defer_moe_finalize`,
         the V2/V3 layer-boundary handoff. ``leave_output_sum`` returns those
         pieces with the selected finalize kernel, for
-        a boundary that owns reduction and the replicated shared add."""
+        a boundary that owns reduction and the replicated shared add.
+        ``shared_experts_input``: hidden_states quantized to the shared experts'
+        static (fp8, scale) gate_up input; only the TP paths below read it."""
         from sglang.srt.layers.moe.mega_moe import forward_mega_moe, should_use_mega_moe
 
         if should_use_mega_moe(self, hidden_states):
@@ -1052,6 +1125,7 @@ class DeepseekV2MoE(nn.Module):
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
                     leave_output_sum=leave_output_sum,
+                    shared_experts_input=shared_experts_input,
                 )
             else:
                 return self.forward_normal(
@@ -1064,6 +1138,7 @@ class DeepseekV2MoE(nn.Module):
                     use_vision_topk=use_vision_topk,
                     return_moe_output=return_moe_output,
                     leave_output_sum=leave_output_sum,
+                    shared_experts_input=shared_experts_input,
                 )
         else:
             return self.forward_deepep(
@@ -1080,6 +1155,7 @@ class DeepseekV2MoE(nn.Module):
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
+        shared_experts_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, MoEOutput]:
         # Note(kpham-sgl): issue order satisfies 3 constraints:
         # - no stream explosion: main (routed) issued before alt block -> capture reuses 1 alt stream;
@@ -1198,11 +1274,16 @@ class DeepseekV2MoE(nn.Module):
 
         # Shared expert on alt stream, issued AFTER the main (routed) branch. See note above.
         # Only the quant-once fp8 pair is shared with it; the routed MXFP8 pre-quant is not.
+        # shared_experts_input was written before the alt stream's wait above.
         with torch.cuda.stream(self.alt_stream):
             shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
-                pre_quant_input=pre_quant_input,
+                pre_quant_input=(
+                    pre_quant_input
+                    if shared_experts_input is None
+                    else shared_experts_input
+                ),
             )
 
         # The routed-input pre-quant was already joined inside the routed MoE apply.
@@ -1266,6 +1347,7 @@ class DeepseekV2MoE(nn.Module):
         use_vision_topk: bool = False,
         return_moe_output: bool = False,
         leave_output_sum: bool = False,
+        shared_experts_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> Union[torch.Tensor, MoEOutput]:
         if hasattr(self, "shared_experts") and use_intel_amx_backend(
             self.shared_experts.gate_up_proj
@@ -1297,7 +1379,11 @@ class DeepseekV2MoE(nn.Module):
                 shared_output = self._forward_shared_experts(
                     hidden_states,
                     gemm_output_zero_allocator,
-                    pre_quant_input=pre_quant_input,
+                    pre_quant_input=(
+                        pre_quant_input
+                        if shared_experts_input is None
+                        else shared_experts_input
+                    ),
                 )
             # router_logits: (num_tokens, n_experts)
             if _is_hip:
@@ -1398,7 +1484,11 @@ class DeepseekV2MoE(nn.Module):
             shared_output = self._forward_shared_experts(
                 hidden_states,
                 gemm_output_zero_allocator,
-                pre_quant_input=pre_quant_input,
+                pre_quant_input=(
+                    pre_quant_input
+                    if shared_experts_input is None
+                    else shared_experts_input
+                ),
             )
 
         if return_moe_output or leave_output_sum:
@@ -2012,6 +2102,12 @@ class DeepseekV2AttentionMLA(
     DeepseekMLAFusedRopeRocmForwardMixin,
     DeepseekMLACpuForwardMixin,
 ):
+    # Set by DeepseekV2DecoderLayer (SGLANG_GLM_FUSE_FP8_INPUT_QUANT): the input
+    # norm hands on (bf16, fp8, scale) with fused_qkv_a_proj_with_mqa's FP8
+    # input, and q_b_proj takes its FP8 input from the q_a norm.
+    _qkv_a_takes_fp8 = False
+    _q_b_takes_fp8 = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2364,6 +2460,11 @@ class DeepseekV2AttentionMLA(
         if self.attn_mha.kv_b_proj is None and hasattr(self, "kv_b_proj"):
             self.attn_mha.kv_b_proj = self.kv_b_proj
 
+        if self._qkv_a_takes_fp8 and isinstance(hidden_states, tuple):
+            # (bf16, fp8, scale): prepare_qkv_latent reads the FP8 from the
+            # attention inputs; the indexer and everything else read the BF16.
+            hidden_states = hidden_states[0]
+
         # when hidden_states is a tuple of tensors, the tuple will include quantized weight and scale tensor
         if isinstance(hidden_states, tuple):
             if (
@@ -2507,6 +2608,9 @@ class DeepseekV2AttentionMLA(
         self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
     ):
         assert self.q_lora_rank is not None
+        if self._qkv_a_takes_fp8 and isinstance(hidden_states, tuple):
+            # (bf16, fp8, scale) from the fused all-reduce + input norm.
+            return self.fused_qkv_a_proj_with_mqa(hidden_states[1:])[0]
         if hasattr(self, "q_a_proj"):
             return torch.cat(
                 (
@@ -2530,7 +2634,28 @@ class DeepseekV2AttentionMLA(
             )
         return self.fused_qkv_a_proj_with_mqa(hidden_states)[0]
 
-    def q_b_proj_forward(self, q_lora: torch.Tensor) -> torch.Tensor:
+    def q_a_layernorm_forward(
+        self, q: torch.Tensor
+    ) -> Tuple[torch.Tensor, Optional[Tuple[torch.Tensor, torch.Tensor]]]:
+        """The q_a norm of ``q`` and, when q_b_proj takes it, the norm quantized
+        to q_b_proj's static (fp8, scale) input in the same kernel; the BF16 norm
+        stays for the indexer and the replicated-q path."""
+        if not self._q_b_takes_fp8 or get_forward().sp_active:
+            return self.q_a_layernorm(q), None
+        scale = self.q_b_proj.input_scale
+        q, q_fp8 = rmsnorm_static_fp8(
+            q, self.q_a_layernorm.weight, self.q_a_layernorm.variance_epsilon, scale
+        )
+        return q, (q_fp8, scale)
+
+    def q_b_proj_forward(
+        self, q_lora: Union[torch.Tensor, Tuple[torch.Tensor, torch.Tensor]]
+    ) -> torch.Tensor:
+        """``q_lora`` may be q_b_proj's (fp8, scale) input from q_a_layernorm_forward."""
+        if isinstance(q_lora, tuple):
+            return self.q_b_proj(q_lora)[0].view(
+                -1, self.num_local_heads, self.qk_head_dim
+            )
         if self._use_min_latency_q_b_gemm is None:
             self._use_min_latency_q_b_gemm = (
                 self._q_b_proj_verified_shape
@@ -2561,6 +2686,9 @@ def _use_mnnvl_cutedsl_fusion() -> bool:
 
 
 class DeepseekV2DecoderLayer(nn.Module):
+    # See _fuse_fp8_input_quant: the FFN input may be (bf16, fp8, scale).
+    _shared_experts_take_fp8 = False
+
     def __init__(
         self,
         config: PretrainedConfig,
@@ -2658,11 +2786,50 @@ class DeepseekV2DecoderLayer(nn.Module):
 
         # A subclass that brings its own norms builds the stages after them.
         if build_stages:
+            self._fuse_fp8_input_quant()
             self.attn_boundary, self.ffn_boundary = self._build_stages(
                 input_layernorm=self.input_layernorm,
                 post_attention_layernorm=self.post_attention_layernorm,
                 qkv_latent_func=self.self_attn.prepare_qkv_latent,
             )
+
+    def _fuse_fp8_input_quant(self) -> None:
+        """SGLANG_GLM_FUSE_FP8_INPUT_QUANT: quantize the input of each static
+        per-tensor FP8 projection in its producer. The fused all-reduce + norms
+        keep a BF16 copy for the indexer, the router and the routed experts; on
+        layer 0, at TP1 or when the fused kernel declines they hand on BF16 and
+        the projections quantize themselves. o_proj (input from the w_vc bmm)
+        keeps its own quant."""
+        if self.is_nextn or get_exec().overlap.enable_two_batch_overlap:
+            return
+        attn = self.self_attn
+        if attn.has_fused_proj and _accepts_static_fp8_input(
+            attn.fused_qkv_a_proj_with_mqa
+        ):
+            self.input_layernorm.fuse_allreduce_input_quant(
+                attn.fused_qkv_a_proj_with_mqa, keep_bf16=True
+            )
+            attn._qkv_a_takes_fp8 = True
+        if attn.has_q_b_proj and _accepts_static_fp8_input(attn.q_b_proj):
+            attn._q_b_takes_fp8 = True
+        mlp = self.mlp
+        if isinstance(mlp, DeepseekV2MoE):
+            # The forward_deepep path does not take the shared experts' input.
+            if not hasattr(mlp, "shared_experts") or mlp._enable_a2a_moe:
+                return
+            mlp, keep_bf16 = mlp.shared_experts, True
+        elif mlp.is_replicated:
+            return
+        else:
+            keep_bf16 = False
+        if _accepts_static_fp8_input(mlp.gate_up_proj):
+            # The dense MLP takes the (fp8, scale) as its input as it is.
+            self.post_attention_layernorm.fuse_allreduce_input_quant(
+                mlp.gate_up_proj, keep_bf16=keep_bf16
+            )
+            self._shared_experts_take_fp8 = keep_bf16
+        if _accepts_static_fp8_input(mlp.down_proj):
+            mlp._down_takes_static_fp8 = True
 
     @classmethod
     def stage_facts(
@@ -2825,11 +2992,20 @@ class DeepseekV2DecoderLayer(nn.Module):
             _mlp_ctx = nullcontext()
 
         with self.ffn_boundary.exit(forward_batch) as ffn_exit, _mlp_ctx:
-            hidden_states = self.mlp(
-                hidden_states,
-                forward_batch,
-                gemm_output_zero_allocator,
-            )
+            if self._shared_experts_take_fp8 and isinstance(hidden_states, tuple):
+                # (bf16, fp8, scale) from the fused all-reduce + norm.
+                hidden_states = self.mlp(
+                    hidden_states[0],
+                    forward_batch,
+                    gemm_output_zero_allocator,
+                    shared_experts_input=hidden_states[1:],
+                )
+            else:
+                hidden_states = self.mlp(
+                    hidden_states,
+                    forward_batch,
+                    gemm_output_zero_allocator,
+                )
         hidden_states = ffn_exit.finish(hidden_states)
 
         return (hidden_states, topk_indices)

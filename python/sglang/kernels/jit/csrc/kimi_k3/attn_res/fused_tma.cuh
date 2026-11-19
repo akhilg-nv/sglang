@@ -171,6 +171,10 @@ struct AttnResTMAParams {
   const bf16_t* __restrict__ cw;          // [H] score norm * proj weight
   const bf16_t* __restrict__ ow;          // [H] out norm weight
   bf16_t* __restrict__ out;               // [T, H]
+  // Fused static FP8 input quant (nullptr = off): out also quantized with the
+  // per-tensor scale at fp8_scale, as static_quant_fp8 of out would be.
+  fp8_e4m3_t* __restrict__ out_fp8;  // [T, H]
+  const float* __restrict__ fp8_scale;
   // Fused bank write (nullptr = off): per-token destination of the prefix
   // row snapshot, bank row nvb (strided by stride_bm like the read rows).
   // The kernel never reads row nvb, so the write races with nothing.
@@ -258,6 +262,15 @@ SGL_DEVICE float2 fma_f32x2(float2 a, float2 b, float2 c) {
   uint64_t result;
   asm("fma.rn.f32x2 %0, %1, %2, %3;" : "=l"(result) : "l"(a_bits), "l"(b_bits), "l"(c_bits));
   return reinterpret_cast<const float2&>(result);
+}
+
+SGL_DEVICE float triton_scale_reciprocal(float scale) {
+  float reciprocal;
+  // Triton's static FP8 quantizer lowers `1.0 / scale` to div.full.f32.
+  // Match it exactly because a one-ULP difference at an E4M3 midpoint can
+  // change the quantized byte.
+  asm("div.full.f32 %0, %1, %2;" : "=f"(reciprocal) : "f"(1.0f), "f"(scale));
+  return reciprocal;
 }
 
 SGL_DEVICE float2 mul_f32x2(float2 a, float2 b) {
@@ -528,6 +541,9 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
       }
       const float scale = inv_sum * rsqrtf(total_sq * inv_sum * inv_sum / static_cast<float>(kDim) + params.eps);
       const float2 scale2 = make_float2(scale, scale);
+      // Read per token rather than held across the token loop: the consumer
+      // register budget is tight.
+      const float fp8_scale_inv = params.out_fp8 != nullptr ? triton_scale_reciprocal(*params.fp8_scale) : 0.f;
 
       auto* out_ptr = params.out + static_cast<int64_t>(token) * kDim;
 #pragma unroll
@@ -550,6 +566,19 @@ SGL_DEVICE void KimiK3AttnResTrait<kDim_, kNumBankRows_, kChunkRows_, kConsumerR
           ptx::st_multimem_16B(out_vec, params.output_mc, global_vid);
         } else {
           out_vec.store(out_ptr, row_vid);
+        }
+        if (params.out_fp8 != nullptr) {
+          // static_quant_fp8's math on the rounded row: multiply by 1 / scale, saturate.
+          AlignedVector<fp8_e4m3_t, kVecElems> fp8_vec;
+#pragma unroll
+          for (uint32_t j = 0; j < kVecElems / 2; ++j) {
+            const auto f = cast<float2>(out_vec[j]);
+            fp8_vec[2 * j] = static_cast<fp8_e4m3_t>(math::min(
+                math::max(f.x * fp8_scale_inv, -DTypeTrait<fp8_e4m3_t>::kFloatMax), DTypeTrait<fp8_e4m3_t>::kFloatMax));
+            fp8_vec[2 * j + 1] = static_cast<fp8_e4m3_t>(math::min(
+                math::max(f.y * fp8_scale_inv, -DTypeTrait<fp8_e4m3_t>::kFloatMax), DTypeTrait<fp8_e4m3_t>::kFloatMax));
+          }
+          fp8_vec.store(params.out_fp8 + static_cast<int64_t>(token) * kDim, row_vid);
         }
       }
     }
@@ -685,7 +714,9 @@ struct AttnResFusedTmaKernel {
       const tvm::ffi::TensorView out,
       int64_t nvb,
       double eps,
-      bool write_prefix) {
+      bool write_prefix,
+      std::optional<tvm::ffi::TensorView> out_fp8,
+      std::optional<tvm::ffi::TensorView> fp8_scale) {
     using namespace host;
 
     auto T_ = SymbolicSize{"num_tokens"};
@@ -697,6 +728,11 @@ struct AttnResFusedTmaKernel {
     TensorMatcher({T_, H_}).with_dtype<bf16_t>().with_device(device).verify(prefix_sum).verify(out);
     TensorMatcher({T_, NB_, H_}).with_dtype<bf16_t>().with_device(device).verify(bank);
     TensorMatcher({H_}).with_dtype<bf16_t>().with_device(device).verify(cw).verify(ow);
+    RuntimeCheck(out_fp8.has_value() == fp8_scale.has_value(), "attn_res_fused_tma: out_fp8 needs fp8_scale");
+    if (out_fp8.has_value()) {
+      TensorMatcher({T_, H_}).with_dtype<fp8_e4m3_t>().with_device(device).verify(out_fp8.value());
+      TensorMatcher({1}).with_dtype<fp32_t>().with_device(device).verify(fp8_scale.value());
+    }
 
     const auto num_tokens = static_cast<int64_t>(T_.unwrap());
     const auto H = static_cast<int64_t>(H_.unwrap());
@@ -735,6 +771,8 @@ struct AttnResFusedTmaKernel {
         .cw = static_cast<const bf16_t*>(cw.data_ptr()),
         .ow = static_cast<const bf16_t*>(ow.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
+        .out_fp8 = out_fp8.has_value() ? static_cast<fp8_e4m3_t*>(out_fp8.value().data_ptr()) : nullptr,
+        .fp8_scale = fp8_scale.has_value() ? static_cast<const float*>(fp8_scale.value().data_ptr()) : nullptr,
         .prefix_dst = write_prefix ? static_cast<bf16_t*>(bank.data_ptr()) + nvb * H : nullptr,
         .input_mc = nullptr,
         .residual = nullptr,
@@ -815,6 +853,8 @@ struct AttnResFusedTmaKernel {
         .cw = static_cast<const bf16_t*>(cw.data_ptr()),
         .ow = static_cast<const bf16_t*>(ow.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
+        .out_fp8 = nullptr,
+        .fp8_scale = nullptr,
         .prefix_dst = nullptr,
         .input_mc = reinterpret_cast<const uint8_t*>(static_cast<uintptr_t>(input_mc_ptr)) +
                     pull.rank * local_elems * sizeof(bf16_t),
@@ -891,6 +931,8 @@ struct AttnResFusedTmaKernel {
         .cw = static_cast<const bf16_t*>(cw.data_ptr()),
         .ow = static_cast<const bf16_t*>(ow.data_ptr()),
         .out = static_cast<bf16_t*>(out.data_ptr()),
+        .out_fp8 = nullptr,
+        .fp8_scale = nullptr,
         .prefix_dst = write_prefix ? static_cast<bf16_t*>(bank.data_ptr()) + nvb * H : nullptr,
         .input_mc = nullptr,
         .residual = nullptr,

@@ -532,6 +532,7 @@ _HC_NORM_KERNELS = [
     ("mhc_post_split_h", "mhc_post_split_h"),
     ("hc_combine_norm", "hc_combine_norm_mxfp8"),
     ("mxfp8_epilogue", "rmsnorm_mxfp8"),
+    ("mxfp8_epilogue", "add_rmsnorm_mxfp8"),
 ]
 for _mod, _fn in _HC_NORM_KERNELS:
     register_kernel(

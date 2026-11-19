@@ -158,6 +158,9 @@ WEIGHT_LOADER_V2_SUPPORTED = [
     "QuarkInt4Fp8LinearMethod",
     "HummingLinearMethod",
     "QuarkLinearMethod",
+    # online_static_fp8 wrappers around block FP8: block scales need the v2 loader
+    "CalibratingWrapper",
+    "_BlockFp8AsTensorFp8",
 ]
 
 _is_cpu = is_cpu()

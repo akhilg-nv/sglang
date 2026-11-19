@@ -1,4 +1,5 @@
-"""CUDA JIT K3 MLA output gate: out = x * sigmoid(gate) in one kernel."""
+"""CUDA JIT K3 MLA output gate: out = x * sigmoid(gate) in one kernel, or that
+output quantized to FP8 with a static per-tensor scale (o_proj's input)."""
 
 from __future__ import annotations
 
@@ -26,7 +27,10 @@ def _jit_mla_output_gate_module() -> Module:
         "kimi_k3_mla_output_gate_" + str(_THREADS),
         *args,
         cuda_files=["kimi_k3/mla_output_gate.cuh"],
-        cuda_wrappers=[("run", f"MlaOutputGateKernel<{args}>::run")],
+        cuda_wrappers=[
+            ("run", f"MlaOutputGateKernel<{args}>::run"),
+            ("run_static_fp8", f"MlaOutputGateKernel<{args}>::run_static_fp8"),
+        ],
         extra_cuda_cflags=["-O3"],
     )
 
@@ -50,4 +54,17 @@ def kimi_k3_mla_output_gate(x: torch.Tensor, gate: torch.Tensor) -> torch.Tensor
     unfused torch.sigmoid + mul pair bit-for-bit. Caller checks covered()."""
     out = torch.empty_like(x)
     _jit_mla_output_gate_module().run(x.view(-1), gate.view(-1), out.view(-1))
+    return out
+
+
+def kimi_k3_mla_output_gate_static_fp8(
+    x: torch.Tensor, gate: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """kimi_k3_mla_output_gate(x, gate) quantized to FP8 with the per-tensor
+    FP32 ``scale``, byte for byte as static_quant_fp8 of it, in the same
+    launch. Caller checks covered()."""
+    out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
+    _jit_mla_output_gate_module().run_static_fp8(
+        x.view(-1), gate.view(-1), scale.reshape(1), out.view(-1)
+    )
     return out

@@ -30,6 +30,7 @@ from sglang.srt.utils import (
     is_npu,
     next_power_of_2,
 )
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_npu = is_npu()
 _use_cpu = is_cpu() and cpu_has_amx_support()
@@ -101,6 +102,7 @@ def _layer_norm_fwd_1pass_kernel(
     Q=None,
     S=None,
     QUANT: tl.constexpr = False,
+    STATIC_QUANT: tl.constexpr = False,
 ):
     if USE_GDC:
         tl.extra.cuda.gdc_wait()
@@ -201,6 +203,11 @@ def _layer_norm_fwd_1pass_kernel(
         y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(Q.dtype.element_ty)
         tl.store(Q + rows[:, None] * N + col_offsets, y_q, mask=mask)
         tl.store(S + tl.program_id(0), y_s)
+    elif STATIC_QUANT:  # FP8 Y by the scale at S, as static_quant_fp8 of the output
+        y = y.to(X.dtype.element_ty).to(tl.float32)
+        y_s_inv = 1.0 / tl.load(S).to(tl.float32)
+        y_q = tl.clamp(y * y_s_inv, -448.0, 448.0).to(Y.dtype.element_ty)
+        tl.store(Y_base, y_q, mask=mask)
     else:
         # Write output
         tl.store(Y_base, y, mask=mask)
@@ -243,6 +250,7 @@ def _layer_norm_fwd(
     is_rms_norm=False,
     activation: str = "swish",
     quant_heads: int = 0,
+    static_scale=None,
 ):
     M, N = x.shape
     if group_size is None:
@@ -266,6 +274,8 @@ def _layer_norm_fwd(
     # allocate output
     if out is not None:
         assert out.shape == x.shape
+    elif static_scale is not None:
+        out = torch.empty_like(x, dtype=torch.float8_e4m3fn)
     else:
         out = torch.empty_like(x)
     assert out.stride(-1) == 1
@@ -298,6 +308,9 @@ def _layer_norm_fwd(
         )
         s = torch.empty((M // quant_heads, 1), dtype=torch.float32, device=x.device)
         quant = {"Q": q, "S": s, "QUANT": True}
+    elif static_scale is not None:
+        # static per-tensor FP8 out: same launch as the unquantized norm
+        quant = {"S": static_scale, "STATIC_QUANT": True}
     # Update grid to use rows_per_block
     grid = (cdiv(M, rows_per_block), ngroups)
     pdl_kwargs = {"USE_GDC": True, "launch_pdl": True} if is_arch_support_pdl() else {}
@@ -399,6 +412,39 @@ def rms_norm_gated(
         activation=activation,
     )
     return y.reshape(x_shape_og)
+
+
+@register_custom_op(
+    op_name="rms_norm_gated_static_fp8",
+    fake_impl=lambda x, weight, z, eps, activation, scale: torch.empty_like(
+        x, dtype=torch.float8_e4m3fn
+    ),
+)
+def rms_norm_gated_static_fp8(
+    x: torch.Tensor,
+    weight: torch.Tensor,
+    z: torch.Tensor,
+    eps: float,
+    activation: str,
+    scale: torch.Tensor,
+) -> torch.Tensor:
+    """rms_norm_gated (norm before gate, one group) of a 2D ``x``, quantized to
+    FP8 with the per-tensor ``scale``; ``z`` is 2D like ``x`` or 3D per token."""
+    if x.stride(-1) != 1:
+        x = x.contiguous()
+    if z.shape == x.shape and z.stride(-1) != 1:
+        z = z.contiguous()
+    y, _, _ = _layer_norm_fwd(
+        x,
+        weight.contiguous(),
+        None,
+        eps,
+        z=z,
+        is_rms_norm=True,
+        activation=activation,
+        static_scale=scale,
+    )
+    return y
 
 
 class LayerNormFn(torch.autograd.Function):

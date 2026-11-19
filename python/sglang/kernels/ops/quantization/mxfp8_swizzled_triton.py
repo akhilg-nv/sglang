@@ -87,6 +87,27 @@ def _mxfp8_quant_kernel(
 
 
 @triton.jit
+def _fast_math_silu(x):
+    # x / (1 + __expf(-x)) as nvcc -use_fast_math emits it (silu_and_mul_clamp).
+    return tl.inline_asm_elementwise(
+        """
+        {
+        .reg .f32 t;
+        mul.ftz.f32 t, $1, 0fBFB8AA3B;
+        ex2.approx.ftz.f32 t, t;
+        add.ftz.f32 t, t, 0f3F800000;
+        div.approx.ftz.f32 $0, $1, t;
+        }
+        """,
+        "=f,f",
+        [x],
+        dtype=tl.float32,
+        is_pure=True,
+        pack=1,
+    )
+
+
+@triton.jit
 def _silu_mul_mxfp8_kernel(
     x_ptr,
     q_ptr,
@@ -113,16 +134,22 @@ def _silu_mul_mxfp8_kernel(
     base = x_ptr + r[:, None].to(tl.int64) * stride_row
     gate = tl.load(base + c[None, :], mask=mask, other=0.0).to(tl.float32)
     up = tl.load(base + hidden + c[None, :], mask=mask, other=0.0).to(tl.float32)
-    if ALPHA is None:
-        act = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
-        prod = (act * up).to(tl.bfloat16).to(tl.float32)
-    else:
+    if ALPHA is not None:
         # the op order Inductor emits for swiglu_no_interleaved_with_alpha_and_limit
         gate = tl.minimum(gate, LIMIT, propagate_nan=tl.PropagateNan.ALL)
         up = tl.maximum(up, -LIMIT, propagate_nan=tl.PropagateNan.ALL)
         up = tl.minimum(up, LIMIT, propagate_nan=tl.PropagateNan.ALL)
         prod = gate * tl.sigmoid(gate * ALPHA) * (up + 1.0)
         prod = prod.to(tl.bfloat16).to(tl.float32)
+    elif LIMIT is not None:
+        # silu_and_mul_clamp: clamp the BF16 inputs (LIMIT is BF16-exact), its
+        # fast-math SiLU, and one rounding of the FP32 product.
+        gate = tl.minimum(gate, LIMIT)
+        up = tl.minimum(tl.maximum(up, -LIMIT), LIMIT)
+        prod = (_fast_math_silu(gate) * up).to(tl.bfloat16).to(tl.float32)
+    else:
+        act = (gate * tl.sigmoid(gate)).to(tl.bfloat16).to(tl.float32)
+        prod = (act * up).to(tl.bfloat16).to(tl.float32)
     p3 = tl.reshape(prod, [BLOCK_R, G, 32])
     amax = tl.max(tl.abs(p3), axis=2)
     if DEEPGEMM:
@@ -319,6 +346,15 @@ def silu_mul_mxfp8(hidden: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
     return _swiglu_mxfp8(hidden, None, None)
 
 
+def silu_mul_clamp_mxfp8(
+    hidden: torch.Tensor, limit: float
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """``hidden [rows, 2n]`` bf16 (gate | up) -> quantized ``silu_and_mul_clamp``,
+    ``silu(min(gate, limit)) * clamp(up, +-limit)`` with the limit rounded to BF16
+    as that kernel clamps."""
+    return _swiglu_mxfp8(hidden, None, float(torch.tensor(limit, dtype=torch.bfloat16)))
+
+
 def swiglu_oai_mxfp8(
     hidden: torch.Tensor, alpha: float, limit: float
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -385,6 +421,7 @@ __all__ = [
     "can_use_silu_mul_mxfp8",
     "indexed_scale_shift_mxfp8_",
     "mxfp8_quantize_swizzled",
+    "silu_mul_clamp_mxfp8",
     "silu_mul_mxfp8",
     "swiglu_oai_mxfp8",
     "swiglu_oai_mxfp8_deepgemm",

@@ -1,9 +1,12 @@
+from typing import Optional
+
 import torch
 import triton
 import triton.language as tl
 
 from sglang.kernels.jit.utils import is_arch_support_pdl
 from sglang.srt.utils import is_hip
+from sglang.srt.utils.custom_op import register_custom_op
 
 _is_hip = is_hip()
 
@@ -389,6 +392,7 @@ def _fused_sigmoid_mul_kernel(
     q_ptr=None,
     s_ptr=None,
     QUANT: tl.constexpr = False,
+    STATIC_QUANT: tl.constexpr = False,
 ):
     """Fuse sigmoid(gate) * attn_output into a single kernel."""
     pid_row = tl.program_id(0).to(tl.int64)
@@ -412,6 +416,11 @@ def _fused_sigmoid_mul_kernel(
         y_q = tl.clamp(y * (1.0 / y_s), -448.0, 448.0).to(q_ptr.dtype.element_ty)
         tl.store(q_ptr + attn_off, y_q, mask=mask)
         tl.store(s_ptr + pid_row, y_s)
+    elif STATIC_QUANT:  # FP8 by the scale at s_ptr, as static_quant_fp8 of out
+        y = result.to(output_ptr.dtype.element_ty).to(tl.float32)
+        y_s_inv = 1.0 / tl.load(s_ptr).to(tl.float32)
+        y_q = tl.clamp(y * y_s_inv, -448.0, 448.0).to(q_ptr.dtype.element_ty)
+        tl.store(q_ptr + attn_off, y_q, mask=mask)
     else:
         tl.store(output_ptr + attn_off, result, mask=mask)
 
@@ -421,6 +430,7 @@ def fused_sigmoid_mul(
     gate: torch.Tensor,
     inplace: bool = False,
     quant: bool = False,
+    static_scale: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
     """
     Fused sigmoid-mul for attention output gating.
@@ -435,6 +445,9 @@ def fused_sigmoid_mul(
     Supports strided gate: if gate is 3D (num_tokens, num_heads, head_dim)
     and attn_output is 2D (num_tokens, hidden_dim), the kernel reads gate
     via explicit strides without requiring a contiguous copy.
+
+    With ``static_scale`` (a per-tensor FP32 scale), returns the FP8 result
+    quantized as static_quant_fp8 would quantize the BF16 one.
     """
     if gate.ndim == 3 and attn_output.ndim == 2:
         # Strided gate path: gate is 3D (num_tokens, num_heads, head_dim)
@@ -454,7 +467,12 @@ def fused_sigmoid_mul(
         gate_stride_row = hidden_dim
         gate_stride_head = hidden_dim
 
-    out = attn_output if inplace else torch.empty_like(attn_output)
+    # The static FP8 mode reads only out's dtype.
+    out = (
+        attn_output
+        if inplace or static_scale is not None
+        else torch.empty_like(attn_output)
+    )
     block_h = 1024 if num_tokens < 1024 else 2048
     kwargs = {}
     if quant:  # one block per row; returns per-token FP8 (q, scale [T, 1])
@@ -462,6 +480,9 @@ def fused_sigmoid_mul(
         q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
         s = torch.empty((num_tokens, 1), dtype=torch.float32, device=q.device)
         kwargs = {"q_ptr": q, "s_ptr": s, "QUANT": True}
+    elif static_scale is not None:
+        q = torch.empty_like(attn_output, dtype=torch.float8_e4m3fn)
+        kwargs = {"q_ptr": q, "s_ptr": static_scale, "STATIC_QUANT": True}
     grid = (num_tokens, triton.cdiv(hidden_dim, block_h))
     _fused_sigmoid_mul_kernel[grid](
         out,
@@ -475,7 +496,78 @@ def fused_sigmoid_mul(
         num_warps=4,
         **kwargs,
     )
-    return (q, s) if quant else out
+    if quant:
+        return q, s
+    return q if static_scale is not None else out
+
+
+@register_custom_op(
+    op_name="fused_sigmoid_mul_static_fp8",
+    fake_impl=lambda attn_output, gate, scale: torch.empty_like(
+        attn_output, dtype=torch.float8_e4m3fn
+    ),
+)
+def fused_sigmoid_mul_static_fp8(
+    attn_output: torch.Tensor, gate: torch.Tensor, scale: torch.Tensor
+) -> torch.Tensor:
+    """attn_output * sigmoid(gate), quantized to FP8 with the per-tensor ``scale``."""
+    return fused_sigmoid_mul(attn_output, gate, static_scale=scale)
+
+
+@triton.jit
+def _silu_and_mul_static_fp8_kernel(
+    q_ptr,
+    x_ptr,
+    s_ptr,
+    x_stride,
+    hidden_dim: tl.constexpr,
+    BLOCK: tl.constexpr,
+    USE_PDL: tl.constexpr = False,
+):
+    """FP8 of silu(gate) * up with the scale at s_ptr, rounded to x's dtype first
+    as silu_and_mul followed by static_quant_fp8."""
+    row = tl.program_id(0).to(tl.int64)
+    cols = tl.program_id(1) * BLOCK + tl.arange(0, BLOCK)
+    mask = cols < hidden_dim
+    if USE_PDL:
+        tl.extra.cuda.gdc_wait()
+    gate = tl.load(x_ptr + row * x_stride + cols, mask=mask, other=0.0).to(tl.float32)
+    up = tl.load(x_ptr + row * x_stride + hidden_dim + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
+    y_s = tl.load(s_ptr).to(tl.float32)
+    if USE_PDL:
+        tl.extra.cuda.gdc_launch_dependents()
+    y = (gate / (1.0 + tl.exp(-gate)) * up).to(x_ptr.dtype.element_ty).to(tl.float32)
+    y_s_inv = 1.0 / y_s
+    y_q = tl.clamp(y * y_s_inv, -448.0, 448.0).to(q_ptr.dtype.element_ty)
+    tl.store(q_ptr + row * hidden_dim + cols, y_q, mask=mask)
+
+
+@register_custom_op(
+    op_name="silu_and_mul_static_fp8",
+    fake_impl=lambda x, scale: x.new_empty(
+        (x.shape[0], x.shape[1] // 2), dtype=torch.float8_e4m3fn
+    ),
+)
+def silu_and_mul_static_fp8(x: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
+    """silu(x[:, :d]) * x[:, d:] quantized to FP8 with the per-tensor ``scale``."""
+    assert x.dim() == 2 and x.stride(-1) == 1
+    num_tokens, hidden_dim = x.shape[0], x.shape[1] // 2
+    q = x.new_empty((num_tokens, hidden_dim), dtype=torch.float8_e4m3fn)
+    block = min(triton.next_power_of_2(hidden_dim), 1024)
+    pdl_kwargs = {"USE_PDL": True, "launch_pdl": True} if is_arch_support_pdl() else {}
+    _silu_and_mul_static_fp8_kernel[(num_tokens, triton.cdiv(hidden_dim, block))](
+        q,
+        x,
+        scale,
+        x.stride(0),
+        hidden_dim,
+        BLOCK=block,
+        num_warps=min(max(block // 256, 1), 8),
+        **pdl_kwargs,
+    )
+    return q
 
 
 @triton.jit

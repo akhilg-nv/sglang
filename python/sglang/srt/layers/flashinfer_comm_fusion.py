@@ -810,6 +810,56 @@ def ensure_workspace_initialized(
     return workspace_manager.initialized
 
 
+def _ready_fusion_workspace_manager(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    max_token_num: int,
+    use_oneshot: Optional[bool],
+    use_attn_tp_group: bool,
+) -> Optional[FlashInferWorkspaceManager]:
+    """The initialized workspace manager for a fused all-reduce + residual +
+    RMSNorm call, or None when the fused kernel cannot take it."""
+    if not is_flashinfer_available() or _flashinfer_comm is None:
+        logger.debug(
+            "FlashInfer not available, falling back to standard implementation"
+        )
+        return None
+
+    world_size = resolve_fusion_world_size(use_attn_tp_group=use_attn_tp_group)
+
+    if world_size <= 1:
+        logger.debug("Single GPU, no need for allreduce fusion")
+        return None
+
+    assert input_tensor.shape[0] <= max_token_num
+    if (
+        not input_tensor.is_contiguous()
+        or not residual.is_contiguous()
+        or not weight.is_contiguous()
+    ):
+        logger.debug("Non-contiguous tensors, skipping FlashInfer allreduce fusion")
+        return None
+
+    if not ensure_workspace_initialized(
+        max_token_num=max_token_num,
+        hidden_dim=input_tensor.shape[-1],
+        use_fp32_lamport=(input_tensor.dtype == torch.float32),
+        dtype=input_tensor.dtype,
+        token_num=input_tensor.shape[0],
+        use_oneshot=use_oneshot,
+        use_attn_tp_group=use_attn_tp_group,
+    ):
+        logger.debug("FlashInfer workspace not available")
+        return None
+
+    workspace_manager = _get_workspace_manager(use_attn_tp_group)
+    if workspace_manager.workspace is None:
+        logger.debug("FlashInfer workspace is None")
+        return None
+    return workspace_manager
+
+
 def fake_flashinfer_allreduce_residual_rmsnorm(
     input_tensor: torch.Tensor,
     residual: torch.Tensor,
@@ -861,42 +911,10 @@ def flashinfer_allreduce_residual_rmsnorm(
     Returns:
         Tuple[torch.Tensor, torch.Tensor]: (norm_output, residual_output)
     """
-    if not is_flashinfer_available() or _flashinfer_comm is None:
-        logger.debug(
-            "FlashInfer not available, falling back to standard implementation"
-        )
-        return None, None
-
-    world_size = resolve_fusion_world_size(use_attn_tp_group=use_attn_tp_group)
-
-    if world_size <= 1:
-        logger.debug("Single GPU, no need for allreduce fusion")
-        return None, None
-
-    assert input_tensor.shape[0] <= max_token_num
-    if (
-        not input_tensor.is_contiguous()
-        or not residual.is_contiguous()
-        or not weight.is_contiguous()
-    ):
-        logger.debug("Non-contiguous tensors, skipping FlashInfer allreduce fusion")
-        return None, None
-
-    if not ensure_workspace_initialized(
-        max_token_num=max_token_num,
-        hidden_dim=input_tensor.shape[-1],
-        use_fp32_lamport=(input_tensor.dtype == torch.float32),
-        dtype=input_tensor.dtype,
-        token_num=input_tensor.shape[0],
-        use_oneshot=use_oneshot,
-        use_attn_tp_group=use_attn_tp_group,
-    ):
-        logger.debug("FlashInfer workspace not available")
-        return None, None
-
-    workspace_manager = _get_workspace_manager(use_attn_tp_group)
-    if workspace_manager.workspace is None:
-        logger.debug("FlashInfer workspace is None")
+    workspace_manager = _ready_fusion_workspace_manager(
+        input_tensor, residual, weight, max_token_num, use_oneshot, use_attn_tp_group
+    )
+    if workspace_manager is None:
         return None, None
 
     residual_out = torch.empty_like(residual)
@@ -921,6 +939,84 @@ def flashinfer_allreduce_residual_rmsnorm(
     _flashinfer_comm.allreduce_fusion(**kwargs)
 
     return norm_out, residual_out
+
+
+def fake_flashinfer_allreduce_residual_rmsnorm_static_fp8(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    keep_bf16: bool = False,
+    use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    norm_out = (
+        torch.empty_like(input_tensor) if keep_bf16 else input_tensor.new_empty(0)
+    )
+    return quant_out, norm_out, torch.empty_like(residual)
+
+
+@register_custom_op(
+    mutates_args=["input_tensor", "residual", "weight"],
+    fake_impl=fake_flashinfer_allreduce_residual_rmsnorm_static_fp8,
+)
+def flashinfer_allreduce_residual_rmsnorm_static_fp8(
+    input_tensor: torch.Tensor,
+    residual: torch.Tensor,
+    weight: torch.Tensor,
+    scale: torch.Tensor,
+    eps: float = 1e-6,
+    max_token_num: int = 2048,
+    keep_bf16: bool = False,
+    use_oneshot: Optional[bool] = None,
+    use_attn_tp_group: bool = True,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """flashinfer_allreduce_residual_rmsnorm whose norm is also quantized to FP8
+    with the static per-tensor ``scale``: both backends multiply the BF16 norm by
+    1 / scale and saturate, as static_quant_fp8. Returns (fp8 norm, BF16 norm,
+    residual); the BF16 norm is empty unless ``keep_bf16``. All are None when
+    the kernel declines."""
+    workspace_manager = _ready_fusion_workspace_manager(
+        input_tensor, residual, weight, max_token_num, use_oneshot, use_attn_tp_group
+    )
+    if workspace_manager is None:
+        return None, None, None
+
+    patterns = _flashinfer_comm.AllReduceFusionPattern
+    quant_out = torch.empty_like(input_tensor, dtype=torch.float8_e4m3fn)
+    norm_out = (
+        torch.empty_like(input_tensor) if keep_bf16 else input_tensor.new_empty(0)
+    )
+    residual_out = torch.empty_like(residual)
+    kwargs = dict(
+        input=input_tensor,
+        workspace=workspace_manager.workspace,
+        pattern=(
+            patterns.kARResidualRMSNormOutFP8Quant
+            if keep_bf16
+            else patterns.kARResidualRMSNormFP8Quant
+        ),
+        launch_with_pdl=True,
+        residual_out=residual_out,
+        quant_out=quant_out,
+        residual_in=residual,
+        rms_gamma=weight,
+        rms_eps=eps,
+        scale_factor=scale.reshape(1),
+        use_oneshot=use_oneshot,
+    )
+    if keep_bf16:
+        kwargs["norm_out"] = norm_out
+    if workspace_manager.backend == "trtllm":
+        kwargs["fp32_acc"] = True
+    if _flashinfer_allreduce_supports_trigger_completion:
+        kwargs["trigger_completion_at_end"] = False
+    _flashinfer_comm.allreduce_fusion(**kwargs)
+
+    return quant_out, norm_out, residual_out
 
 
 def can_use_flashinfer_allreduce(

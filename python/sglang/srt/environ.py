@@ -1084,6 +1084,38 @@ class Envs:
     SGLANG_OPT_HOPPER_BLOCK_FP8_BF16 = EnvBool(True)
     SGLANG_MOE_NVFP4_DISPATCH = EnvBool(False)
     SGLANG_NVFP4_CKPT_FP8_GEMM_IN_ATTN = EnvBool(False)
+    # Experimental: quantize BF16 linears that a ModelOpt checkpoint leaves unquantized to MXFP8
+    # at load time (dynamic 1x32 activation scales) when their prefix matches this regex.
+    SGLANG_MODELOPT_BF16_LINEAR_MXFP8_REGEX = EnvStr(None)
+    # With the regex above: record each matching linear's max |input| to <path>.tp<rank>.json (BF16 kept) ...
+    SGLANG_MODELOPT_BF16_LINEAR_CALIB_DUMP = EnvStr(None)
+    # ... or run matching linears as static per-tensor FP8 with input_scale = amax / 448 from this merged JSON
+    # (instead of MXFP8; linears missing from the JSON stay BF16).
+    SGLANG_MODELOPT_BF16_LINEAR_FP8_AMAX = EnvStr(None)
+    # With SGLANG_MODELOPT_BF16_LINEAR_FP8_AMAX: run matching BF16 linears as NVFP4 W4A4 instead of FP8.
+    SGLANG_MODELOPT_BF16_LINEAR_NVFP4 = EnvBool(False)
+    # Experimental: block-FP8 checkpoint linears matching this regex use the calibration envs above too
+    # (record amax, or run as static per-tensor FP8 requantized from the block weights).
+    SGLANG_MODELOPT_BLOCK_FP8_PER_TENSOR_REGEX = EnvStr(None)
+    # Experimental: JSON table of per-(N, K) small-M BF16 GEMM kernels measured on this GPU
+    # (kernel-benchmarking make_bf16_table.py); checked before the default BF16 dispatch.
+    SGLANG_BF16_GEMM_SHAPE_TABLE = EnvStr(None)
+    # Experimental: Qwen3.5 on CUDA quantizes the input of each static per-tensor FP8 ModelOpt linear
+    # in its producer (all-reduce + norm, gated norm, sigmoid-mul, silu-mul) instead of a separate kernel.
+    SGLANG_QWEN35_FUSE_FP8_INPUT_QUANT = EnvBool(False)
+    # Experimental: the same for the DeepSeek-V2 family decoder layer (target GLM-5.x): fused_qkv_a_proj_with_mqa,
+    # q_b_proj and the dense / shared-expert MLP take their FP8 input from all-reduce + norm, q_a norm and silu-mul.
+    SGLANG_GLM_FUSE_FP8_INPUT_QUANT = EnvBool(False)
+    # Experimental: the same for Kimi-K3 MLA layers: q_b_proj takes its FP8 input from the q_a norm and o_proj from
+    # the output gate (x * sigmoid(g_proj)). The DSPARK draft is a separate model and never reads it.
+    SGLANG_K3_FUSE_FP8_INPUT_QUANT = EnvBool(False)
+    # Experimental: on CUDA, MXFP8 (1x32, UE8M0) linears of a target model take their activation quantized by the
+    # kernel that produces it instead of a separate mxfp8_quantize: MiniMax-M3 attention and FFN inputs (add +
+    # RMSNorm), DeepSeek-V4.1 shared-expert inputs (mHC all-reduce + norm, clamped SiLU-and-mul) and q_lora (M <= 128).
+    SGLANG_OPT_FUSE_MXFP8_INPUT_QUANT = EnvBool(False)
+    # Experimental: append every BF16 GEMM (M, N, K) the default dispatch sees to this file (one per line, deduplicated
+    # per process), to build SGLANG_BF16_GEMM_SHAPE_TABLE for a deployment's real shapes.
+    SGLANG_BF16_GEMM_SHAPE_LOG = EnvStr(None)
     SGLANG_NVFP4_CKPT_FP8_NEXTN_MOE = EnvBool(False)
     # GLM NextN (MTP): cast the draft layer's bf16 fused MoE to per-channel FP8
     # on load. Unrelated to the NVFP4 block-FP8 NextN path above.

@@ -30,6 +30,7 @@ from transformers import PretrainedConfig
 from sglang.kernels.ops.elementwise.elementwise import (
     fused_gate_sigmoid_mul,
     fused_gate_sigmoid_mul_add,
+    silu_and_mul_static_fp8,
 )
 from sglang.srt.batch_overlap.two_batch_overlap import model_forward_stages
 from sglang.srt.distributed import (
@@ -95,6 +96,7 @@ from sglang.srt.model_executor.runner_backend_utils.breakable_cuda_graph.context
 from sglang.srt.model_loader.weight_utils import default_weight_loader
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_stream,
 )
@@ -208,6 +210,9 @@ class Qwen2MoeMLP(nn.Module):
         # fused path replaces act_fn + the down_proj input quantization with a
         # single kernel and hands down_proj a prequantized (fp4, scale) tuple.
         self._enable_silu_fp4_quant_fusion = False
+        # Set externally (see qwen3_5.py) when down_proj takes an (fp8, scale)
+        # input quantized with its static per-tensor input_scale.
+        self._fuse_silu_fp8_quant = False
         self._masked_m_cache: dict = {}
         # Lazily derived after weight load (input_scale_inv does not exist yet
         # at construction time); the fused kernel requires a 1-D global scale.
@@ -246,6 +251,10 @@ class Qwen2MoeMLP(nn.Module):
         gate_up, _ = self.gate_up_proj(x)
         if self._enable_silu_fp4_quant_fusion and not isinstance(gate_up, tuple):
             x, _ = self.down_proj(self._silu_fp4_quant_fused(gate_up))
+            return x
+        if self._fuse_silu_fp8_quant and not get_forward().sp_active:
+            scale = self.down_proj.input_scale
+            x, _ = self.down_proj((silu_and_mul_static_fp8(gate_up, scale), scale))
             return x
         x = self.act_fn(gate_up)
         x, _ = self.down_proj(x)
@@ -512,11 +521,18 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         )
 
     def _forward_shared_experts(
-        self, hidden_states: torch.Tensor, apply_gate: bool = True
+        self,
+        hidden_states: torch.Tensor,
+        apply_gate: bool = True,
+        shared_expert_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ):
+        """``shared_expert_input``: hidden_states already quantized to the
+        shared expert's (fp8, scale) input; the gate reads hidden_states."""
         shared_output = None
         if self.shared_expert is not None:
-            shared_output = self.shared_expert(hidden_states)
+            shared_output = self.shared_expert(
+                hidden_states if shared_expert_input is None else shared_expert_input
+            )
             if self.shared_expert_gate is not None and apply_gate:
                 if use_intel_amx_backend(self.shared_expert_gate):
                     shared_output = torch.ops.sgl_kernel.fused_linear_sigmoid_mul(
@@ -754,6 +770,7 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         use_fused_gate: bool = False,
         defer_finalize: bool = False,
+        shared_expert_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
         current_stream = torch.cuda.current_stream()
 
@@ -778,7 +795,9 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         self.alt_stream.wait_stream(current_stream)
         shared_output = (
             self._forward_shared_experts(
-                hidden_states.clone(), apply_gate=not use_fused_gate
+                hidden_states.clone() if shared_expert_input is None else hidden_states,
+                apply_gate=not use_fused_gate,
+                shared_expert_input=shared_expert_input,
             )
             if self.shared_expert is not None
             else None
@@ -816,7 +835,10 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
         hidden_states: torch.Tensor,
         forward_batch: Optional[ForwardBatch] = None,
         defer_finalize: bool = False,
+        shared_expert_input: Optional[Tuple[torch.Tensor, torch.Tensor]] = None,
     ) -> torch.Tensor:
+        """``shared_expert_input`` is hidden_states quantized to the separate
+        shared expert's (fp8, scale) input; the deepep and mega paths ignore it."""
         num_tokens, hidden_dim = hidden_states.shape
         hidden_states = hidden_states.view(-1, hidden_dim)
         if defer_finalize and num_tokens == 0:
@@ -855,10 +877,13 @@ class Qwen2MoeSparseMoeBlock(nn.Module):
                 hidden_states,
                 use_fused_gate=use_fused_gate,
                 defer_finalize=defer_finalize,
+                shared_expert_input=shared_expert_input,
             )
         else:
             shared_output = self._forward_shared_experts(
-                hidden_states, apply_gate=not use_fused_gate and not defer_finalize
+                hidden_states,
+                apply_gate=not use_fused_gate and not defer_finalize,
+                shared_expert_input=shared_expert_input,
             )
             if defer_finalize and shared_output is not None:
                 shared_output = self._gate_shared_output_out_of_place(

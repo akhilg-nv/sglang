@@ -92,6 +92,7 @@ from sglang.srt.layers.moe.utils import (
 from sglang.srt.layers.quantization.base_config import QuantizationConfig
 from sglang.srt.layers.quantization.fp8_utils import block_quant_dequant
 from sglang.srt.layers.quantization.modelslim.modelslim import ModelSlimConfig
+from sglang.srt.layers.quantization.unquant import UnquantizedLinearMethod
 from sglang.srt.layers.radix_linear_attention import RadixLinearAttention
 from sglang.srt.layers.utils import PPMissingLayer, get_layer_id
 from sglang.srt.layers.vocab_parallel_embedding import (
@@ -138,6 +139,7 @@ from sglang.srt.multimodal.kimi_k3_image_processing import (
 from sglang.srt.multimodal.mm_utils import materialize_multimodal_features
 from sglang.srt.runtime_context import (
     get_exec,
+    get_forward,
     get_parallel,
     get_platform,
     get_spec,
@@ -371,6 +373,37 @@ def _o_proj_takes_output(o_proj: RowParallelLinear) -> bool:
     """Whether o_proj can write into caller-owned storage. ``apply_into`` is an
     optional quant-method capability; only the unquantized method has it."""
     return getattr(o_proj.quant_method, "apply_into", None) is not None
+
+
+def _accepts_static_fp8_input(linear: nn.Module) -> bool:
+    """Whether ``linear`` takes an (fp8, scale) input quantized with its static
+    per-tensor input_scale, so its producer quantizes for it
+    (SGLANG_K3_FUSE_FP8_INPUT_QUANT)."""
+    if not envs.SGLANG_K3_FUSE_FP8_INPUT_QUANT.get():
+        return False
+    from sglang.srt.layers.quantization.modelopt_quant import accepts_static_fp8_input
+
+    return accepts_static_fp8_input(linear)
+
+
+def _same_calibrated_scale(a: nn.Module, b: nn.Module) -> bool:
+    """Whether two static FP8 linears get the same input_scale: both converted
+    at load with a calibrated amax (online_static_fp8), and the amaxes equal."""
+    amax = getattr(a.quant_method, "amax", None)
+    return amax is not None and amax == getattr(b.quant_method, "amax", None)
+
+
+def _bank_fp8_input(
+    linear: nn.Module, hidden_states: torch.Tensor
+) -> Optional[Tuple[torch.Tensor, torch.Tensor]]:
+    """The (fp8, scale) input of ``linear`` that the attention-residual bank
+    read quantized along with ``hidden_states`` (AttnBankState.attn_input_quant),
+    or None when hidden_states is not that read's output as it returned it
+    (no fused read, or a path that moved or gathered it)."""
+    stash = getattr(linear, "static_fp8_input", None)
+    if stash is None or stash[0] is not hidden_states or get_forward().sp_active:
+        return None
+    return stash[1:]
 
 
 def _k3_all_reduce_add(hidden_states, residual, forward_batch):
@@ -725,6 +758,16 @@ class KimiK3MoE(nn.Module):
         if not (get_platform().is_cuda or get_platform().is_hip):
             return
         if self.shared_experts is not None and get_moe_a2a_backend().is_none():
+            # Shared experts quantized at load time (SGLANG_MODELOPT_BF16_LINEAR_MXFP8_REGEX) must keep
+            # their own quant method: merging their BF16 weight here would bypass it.
+            if not all(
+                isinstance(m.quant_method, UnquantizedLinearMethod)
+                for m in (
+                    self.shared_experts.gate_up_proj,
+                    self.shared_experts.down_proj,
+                )
+            ):
+                return
             mods = [
                 self.shared_experts.gate_up_proj,
                 self.gate,
@@ -2008,6 +2051,12 @@ class KimiK3DeltaAttention(nn.Module):
         self, hidden_states: torch.Tensor, defer_f_b: bool = False
     ):
         if self.use_full_rank_gate:
+            # SGLANG_K3_FUSE_FP8_INPUT_QUANT: [q, k, v, g] reads the FP8 input
+            # the bank read wrote with hidden_states; the [f_a | b] GEMVs read
+            # the BF16.
+            qkvg_input = _bank_fp8_input(self.fused_qkvg_proj, hidden_states)
+            if qkvg_input is None:
+                qkvg_input = hidden_states
             if self._bfa_w is not None:
                 w = self._bfa_w
                 n_fa, n_b = self._bfa_fa_size, self._bfa_b_size
@@ -2041,7 +2090,7 @@ class KimiK3DeltaAttention(nn.Module):
                     alt = self._bfa_alt_stream
                     cur = torch.cuda.current_stream()
                     alt.wait_stream(cur)
-                    fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                    fused_states, _ = self.fused_qkvg_proj(qkvg_input)
                     with torch.cuda.stream(alt):
                         bfa = gemm(hidden_states, w)
                         forget_gate = (
@@ -2056,7 +2105,7 @@ class KimiK3DeltaAttention(nn.Module):
                     cur.wait_stream(alt)
                     return qkv, beta, forget_gate, g_proj_states
 
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                fused_states, _ = self.fused_qkvg_proj(qkvg_input)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 bfa = gemm(hidden_states, w)
                 forget_gate = (
@@ -2066,7 +2115,7 @@ class KimiK3DeltaAttention(nn.Module):
                 )
                 beta = bfa[..., n_fa : n_fa + n_b]
             else:
-                fused_states, _ = self.fused_qkvg_proj(hidden_states)
+                fused_states, _ = self.fused_qkvg_proj(qkvg_input)
                 qkv, g_proj_states = torch.split(fused_states, self.split_sizes, dim=-1)
                 beta = self.b_proj(hidden_states)[0]
                 f_a = self.f_a_proj(hidden_states)[0]
@@ -2225,6 +2274,14 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 )
                 self.register_parameter(f"{role}_b_qweight_type", qweight_type)
             self._kimi_split_gguf_kv_b = True
+        # SGLANG_K3_FUSE_FP8_INPUT_QUANT: the q_a norm also writes q_b_proj's
+        # static FP8 input (q_a_layernorm_forward). The DCP replicated q
+        # projection reads the BF16 norm, so it keeps sgl_kernel's.
+        self._q_b_takes_fp8 = (
+            self.has_q_b_proj
+            and not get_parallel().dcp_replicate_q_proj
+            and _accepts_static_fp8_input(self.q_b_proj)
+        )
         # Installed before the output-gate wrap below so the gate multiply is
         # applied to x before the fused GEMM+AR sees it.
         if self.all_reduce_fusion and not _o_proj_takes_output(self.o_proj):
@@ -2280,6 +2337,18 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                 if self._gate_alt_stream is not None
                 else 0
             )
+            # SGLANG_K3_FUSE_FP8_INPUT_QUANT: the gate kernel also writes
+            # o_proj's static FP8 input. Such an o_proj has no apply_into, so
+            # the symmetric-output wrap above (sized from a BF16 x) is off.
+            self._o_proj_takes_fp8 = _accepts_static_fp8_input(self.o_proj)
+            # ... and g_proj, which reads the same input as
+            # fused_qkv_a_proj_with_mqa, takes the FP8 the bank read wrote for
+            # that projection when its calibrated input_scale is the same.
+            self._g_proj_shares_fp8 = (
+                self.has_fused_proj
+                and _accepts_static_fp8_input(self.g_proj)
+                and _same_calibrated_scale(self.g_proj, self.fused_qkv_a_proj_with_mqa)
+            )
             _orig_o_proj_forward = self.o_proj.forward
 
             def _gated_o_proj_forward(x, *args, **kwargs):
@@ -2289,12 +2358,21 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
                     gate = self._compute_output_gate(gate_input)
                     from sglang.kernels.ops.attention import mla_output_gate
 
-                    if mla_output_gate.covered(x, gate):
+                    if not mla_output_gate.covered(x, gate):
+                        x = x * torch.sigmoid(gate)
+                    elif self._o_proj_takes_fp8 and not get_forward().sp_active:
+                        # The kernel below with o_proj's input quant fused in.
+                        scale = self.o_proj.input_scale
+                        x = (
+                            mla_output_gate.kimi_k3_mla_output_gate_static_fp8(
+                                x, gate, scale
+                            ),
+                            scale,
+                        )
+                    else:
                         # One kernel for x * sigmoid(gate); double rounding
                         # matches the unfused pair bit-for-bit.
                         x = mla_output_gate.kimi_k3_mla_output_gate(x, gate)
-                    else:
-                        x = x * torch.sigmoid(gate)
                 elif self._gate_pending_stream is not None:
                     # Even a skipped gate must close its capture branch.
                     torch.cuda.current_stream().wait_stream(self._gate_pending_stream)
@@ -2323,6 +2401,19 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             return AttnForwardMethod.MLA
         return method
 
+    def prepare_qkv_latent(
+        self, hidden_states: torch.Tensor, forward_batch: ForwardBatch
+    ):
+        # SGLANG_K3_FUSE_FP8_INPUT_QUANT: the FP8 input the bank read wrote.
+        fp8_input = (
+            _bank_fp8_input(self.fused_qkv_a_proj_with_mqa, hidden_states)
+            if self.has_fused_proj
+            else None
+        )
+        if fp8_input is not None:
+            return self.fused_qkv_a_proj_with_mqa(fp8_input)[0]
+        return super().prepare_qkv_latent(hidden_states, forward_batch)
+
     def _fork_output_gate(self, hidden_states: torch.Tensor) -> None:
         """Fork early, but record the gate after attention to limit replay streams."""
         self._gate_pending_stream = None
@@ -2338,12 +2429,17 @@ class KimiK3MLAAttention(DeepseekV2AttentionMLA):
             self._gate_pending_stream = alt
 
     def _compute_output_gate(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        gate_input = hidden_states
+        if self._g_proj_shares_fp8:
+            fp8_input = _bank_fp8_input(self.fused_qkv_a_proj_with_mqa, hidden_states)
+            if fp8_input is not None:
+                gate_input = fp8_input
         alt = self._gate_pending_stream
         self._gate_pending_stream = None
         if alt is None:
-            return self.g_proj(hidden_states)[0]
+            return self.g_proj(gate_input)[0]
         with torch.cuda.stream(alt):
-            gate, _ = self.g_proj(hidden_states)
+            gate, _ = self.g_proj(gate_input)
         torch.cuda.current_stream().wait_stream(alt)
         return gate
 
@@ -2498,6 +2594,9 @@ def _stage_facts(
 class KimiK3DecoderLayer(nn.Module):
     """Decoder layer carrying the K3 attention-residual stream."""
 
+    # See _attn_input_quant_linear.
+    _attn_input_quant: Optional[nn.Module] = None
+
     def __init__(
         self,
         config: KimiLinearConfig,
@@ -2606,6 +2705,8 @@ class KimiK3DecoderLayer(nn.Module):
         sp_collective = k3_sp_collective.enabled()
         bank = None
         if self.use_attn_residuals:
+            # Kept out of this module's children, like RMSNorm.fuse_input_quant.
+            self.__dict__["_attn_input_quant"] = self._attn_input_quant_linear()
             bank = AttnBankState(
                 attn_bank,
                 self.self_attention_res_proj,
@@ -2618,6 +2719,7 @@ class KimiK3DecoderLayer(nn.Module):
                 and sp_collective
                 and envs.SGLANG_K3_SP_ATTN_RES.get(),
                 reads_slices=_carries_bank_slices(config, sp_collective),
+                attn_input_quant=self._attn_input_quant,
             ).residual_ops()
         attn, ffn = _stage_facts(
             config, layer_idx, sp_collective=sp_collective, bank=bank
@@ -2626,6 +2728,20 @@ class KimiK3DecoderLayer(nn.Module):
             (attn, self.input_layernorm),
             (ffn, self.post_attention_layernorm),
         )
+
+    def _attn_input_quant_linear(self) -> Optional[nn.Module]:
+        """SGLANG_K3_FUSE_FP8_INPUT_QUANT: the static FP8 projection that reads
+        the attention input, whose FP8 input the bank's attention read also
+        writes (AttnBankState.attn_input_quant): fused_qkv_a_proj_with_mqa
+        (MLA) or the [q, k, v, g] fused_qkvg_proj (KDA)."""
+        attn = self.self_attn
+        if isinstance(attn, KimiK3MLAAttention):
+            linear = attn.fused_qkv_a_proj_with_mqa if attn.has_fused_proj else None
+        else:
+            linear = getattr(attn, "fused_qkvg_proj", None)
+        if linear is None or not _accepts_static_fp8_input(linear):
+            return None
+        return linear
 
     def _ffn_input_fusions(self):
         """K3's kernels that complete the attention output's sum with the
@@ -2671,6 +2787,9 @@ class KimiK3DecoderLayer(nn.Module):
             forward_batch=forward_batch,
             zero_allocator=zero_allocator,
         )
+        if self._attn_input_quant is not None:
+            # The bank read's FP8 input lives as long as the attention reading it.
+            self._attn_input_quant.static_fp8_input = None
 
         if qkv_latent_func is not None:
             get_attn_tp_context().clear_attn_inputs()

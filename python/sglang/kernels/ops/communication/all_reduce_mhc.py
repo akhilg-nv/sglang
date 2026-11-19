@@ -243,6 +243,37 @@ def all_reduce_mhc_post_combine_norm(
     )
 
 
+def all_reduce_mhc_post_combine_norm_quant(
+    x: torch.Tensor,
+    residual: torch.Tensor,
+    post: torch.Tensor,
+    comb: torch.Tensor,
+    pre: torch.Tensor,
+    norm_weight: torch.Tensor,
+    eps: float,
+    *,
+    world_size: int,
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """:func:`all_reduce_mhc_post_combine_norm` plus the MXFP8 quantization of the
+    normalized row (rows <= 128): the quant finalize kernel driven with identity
+    routing. Returns ``(reduced, mhc_out, normalized, quantized, scales)``."""
+    idx, weights = _identity_routing(x.shape[0], x.device)
+    return moe_finalize_all_reduce_mhc_post_combine_norm_quant(
+        x,
+        idx,
+        weights,
+        1,
+        None,
+        residual,
+        post,
+        comb,
+        pre,
+        norm_weight,
+        eps,
+        world_size=world_size,
+    )
+
+
 @cache_once
 def _jit_mhc_quant_module(world_size, top_k, cluster_size, weight_dtype):
     require_cluster_launch_arch()

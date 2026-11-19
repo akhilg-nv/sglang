@@ -158,6 +158,8 @@ def attn_res_fused_tma(
     eps: float,
     *,
     write_prefix: bool = False,
+    out_fp8: torch.Tensor | None = None,
+    fp8_scale: torch.Tensor | None = None,
 ) -> None:
     """Warp-specialized TMA aggregation (score -> online softmax -> weighted
     combine -> fused output RMSNorm), one persistent CTA per SM: a producer
@@ -182,9 +184,21 @@ def attn_res_fused_tma(
     write_prefix : also snapshot the prefix row into bank[:, nvb, :]
                  (bit-exact copy, fused into the score pass which already
                  has the row in registers); requires NB > nvb
+    out_fp8    : optional [T, H] float8_e4m3fn buffer: also written with out
+                 quantized by the per-tensor FP32 ``fp8_scale``, byte for byte
+                 as static_quant_fp8 of out (a static FP8 consumer's input)
     """
     _jit_fused_tma_module(*_tuning(nvb, prefix_sum.shape[0])).run(
-        prefix_sum, bank, cw, ow, out, nvb, eps, write_prefix
+        prefix_sum,
+        bank,
+        cw,
+        ow,
+        out,
+        nvb,
+        eps,
+        write_prefix,
+        out_fp8,
+        None if fp8_scale is None else fp8_scale.reshape(1),
     )
 
 
